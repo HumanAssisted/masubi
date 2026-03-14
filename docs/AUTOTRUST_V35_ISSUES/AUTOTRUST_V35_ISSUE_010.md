@@ -34,3 +34,6 @@ def __exit__(self, exc_type, exc_val, exc_tb) -> None:
 ## Affected Files
 - `autotrust/providers/hyperbolic.py`
 - `tests/test_providers.py` (add test for auto-stop on normal exit)
+
+## Status: Fixed
+Added auto-stop loop in `BudgetGuard.__exit__()` that stops all active instances regardless of how the context exits. All tests pass.

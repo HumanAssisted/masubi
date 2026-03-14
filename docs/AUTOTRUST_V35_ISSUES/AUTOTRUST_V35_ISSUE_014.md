@@ -43,3 +43,6 @@ def _handle_keep_discard(keep: bool, experiment_num: int) -> None:
 
 ## Affected Files
 - `run_loop.py`
+
+## Status: Fixed
+Replaced `check=False` with `capture_output=True, text=True` and explicit return code checking with error logging for all git operations. All tests pass.

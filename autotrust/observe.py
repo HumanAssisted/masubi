@@ -6,18 +6,38 @@ Uses structlog for JSON output. Manages per-run directories under runs/<run_id>/
 from __future__ import annotations
 
 import json
-import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import structlog
+
 if TYPE_CHECKING:
     from autotrust.config import Spec
     from autotrust.schemas import ExperimentResult, RunArtifacts
 
-logger = logging.getLogger(__name__)
+
+def configure_structlog() -> None:
+    """Configure structlog with JSON output, ISO timestamps, and log level."""
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+
+# Configure on import
+configure_structlog()
+
+logger = structlog.get_logger()
 
 
 # ---------------------------------------------------------------------------
@@ -71,12 +91,13 @@ def start_run(spec: Spec, base_dir: Path | None = None) -> RunContext:
 
 
 def log_experiment(ctx: RunContext, result: ExperimentResult) -> None:
-    """Log an experiment result to metrics.json and store in context."""
+    """Log an experiment result to metrics.jsonl (append) and store in context."""
     result_dict = result.model_dump()
     ctx.experiments.append(result_dict)
 
-    metrics_path = ctx.run_dir / "metrics.json"
-    metrics_path.write_text(json.dumps(result_dict, indent=2, default=str))
+    metrics_path = ctx.run_dir / "metrics.jsonl"
+    with open(metrics_path, "a") as f:
+        f.write(json.dumps(result_dict, default=str) + "\n")
 
     logger.info(
         "Experiment %s: composite=%.4f, gates=%s",
@@ -119,7 +140,7 @@ def finalize_run(ctx: RunContext) -> RunArtifacts:
     summary_path.write_text("\n".join(summary_lines))
 
     artifacts = RunArtifacts(
-        metrics_json=ctx.run_dir / "metrics.json",
+        metrics_json=ctx.run_dir / "metrics.jsonl",
         predictions_jsonl=ctx.run_dir / "predictions.jsonl",
         config_json=ctx.run_dir / "config.json",
         summary_txt=summary_path,

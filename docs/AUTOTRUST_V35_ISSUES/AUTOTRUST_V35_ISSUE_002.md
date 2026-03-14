@@ -32,3 +32,12 @@ Without data, the eval set and gold set are empty, and `run_loop.py` cannot exec
 
 ## Affected Files
 - `autotrust/data.py`
+
+## Status: Fixed
+Implemented all five data pipeline subcommands:
+- `build_train()`: Generates synthetic email chains from built-in scenarios with safety filtering, dedup, and JSONL output. Falls back to templates when Ollama is unavailable.
+- `build_eval()`: Same pipeline with spec.data.eval_set_size count.
+- `build_gold()`: Generates gold-set candidates for human annotation.
+- `annotate_export()`: Reads gold candidates and exports in annotator-friendly format with per-axis scoring instructions and rubric reference.
+- `calibrate_judge()`: Ingests human annotations JSONL, computes per-axis Cohen's Kappa, flags low-Kappa axes, computes effective weights, and writes CalibrationReport JSON.
+All tests pass.

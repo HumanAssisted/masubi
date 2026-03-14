@@ -36,3 +36,6 @@ Also update `test_get_effective_weights_with_downweight` in `tests/test_config.p
 - `autotrust/config.py`
 - `tests/test_config.py`
 - `tests/test_kappa_downweight.py`
+
+## Status: Fixed
+Changed `get_effective_weights()` to use `scale = min(kappa / min_gold_kappa, 1.0)` and `weight * scale` instead of `weight * kappa`. Updated redistribution eligibility to check `kappa >= min_kappa` instead of `kappa == 1.0`. Logging now only warns when `kappa < min_kappa`. All 13 config/kappa tests pass.

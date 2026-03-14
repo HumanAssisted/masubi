@@ -52,14 +52,17 @@ def test_start_run_snapshots_config(tmp_path, spec):
 
 
 def test_log_experiment_writes_metrics(tmp_path, spec, sample_result):
-    """log_experiment() writes metrics.json with gate results."""
+    """log_experiment() appends to metrics.jsonl with gate results."""
     from autotrust.observe import start_run, log_experiment
 
     ctx = start_run(spec, base_dir=tmp_path)
     log_experiment(ctx, sample_result)
-    metrics_path = ctx.run_dir / "metrics.json"
+    log_experiment(ctx, sample_result)  # log twice to verify append
+    metrics_path = ctx.run_dir / "metrics.jsonl"
     assert metrics_path.exists()
-    data = json.loads(metrics_path.read_text())
+    lines = metrics_path.read_text().strip().split("\n")
+    assert len(lines) == 2  # both experiments persisted
+    data = json.loads(lines[0])
     assert data["composite"] == 0.85
     assert data["gate_results"]["gold"] is True
 

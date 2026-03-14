@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
+
+import structlog
 
 from autotrust.providers import (
     ScoringProvider,
@@ -12,7 +13,7 @@ from autotrust.providers import (
     retry_on_error,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 class HyperbolicScorer(ScoringProvider):
@@ -81,6 +82,13 @@ class BudgetGuard:
         self.active_instances.append(instance_id)
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        # Auto-stop all active instances on exit (normal or exceptional)
+        for instance_id in self.active_instances:
+            try:
+                self.trainer.stop_gpu(instance_id)
+                logger.info("Stopped instance %s on exit", instance_id)
+            except Exception as exc:
+                logger.error("Failed to stop instance %s on exit: %s", instance_id, exc)
         logger.info("BudgetGuard: total spent $%.2f / $%.2f", self.total_spent, self.max_usd)
         return None
 

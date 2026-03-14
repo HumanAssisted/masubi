@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Literal
 
+import structlog
 import yaml
 from pydantic import BaseModel, field_validator
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 _DEFAULT_SPEC_PATH = Path(__file__).parent.parent / "spec.yaml"
 
@@ -175,18 +175,21 @@ def get_effective_weights(
     Only used by compute_composite(), never by gold_regression_gate().
 
     For each axis:
-      effective_weight = original_weight * kappa
+      scale = min(actual_kappa / min_gold_kappa, 1.0)
+      effective_weight = original_weight * scale
     Zero-weighted axes stay at 0.0.
     If redistribute_remainder is True, lost weight is redistributed proportionally
-    among non-downweighted (kappa=1.0) positive-weighted axes.
+    among non-downweighted (scale=1.0) positive-weighted axes.
     """
+    min_kappa = spec.judge.min_gold_kappa
     raw_weights: dict[str, float] = {}
     for axis in spec.trust_axes:
         kappa = kappa_per_axis.get(axis.name, 1.0)
         if axis.weight == 0.0:
             raw_weights[axis.name] = 0.0
         else:
-            raw_weights[axis.name] = axis.weight * kappa
+            scale = min(kappa / min_kappa, 1.0)  # cap at 1.0 for kappa >= min
+            raw_weights[axis.name] = axis.weight * scale
 
     if spec.calibration.redistribute_remainder:
         original_total = sum(a.weight for a in spec.trust_axes if a.weight > 0)
@@ -194,10 +197,10 @@ def get_effective_weights(
         lost = original_total - current_total
 
         if lost > 1e-9:
-            # Redistribute among axes that were NOT downweighted (kappa == 1.0) and have positive weight
+            # Redistribute among axes that were NOT downweighted (kappa >= min_kappa) and have positive weight
             eligible = [
                 a.name for a in spec.trust_axes
-                if a.weight > 0 and kappa_per_axis.get(a.name, 1.0) == 1.0
+                if a.weight > 0 and kappa_per_axis.get(a.name, 1.0) >= min_kappa
             ]
             eligible_total = sum(raw_weights[n] for n in eligible)
             if eligible_total > 0:
@@ -208,7 +211,7 @@ def get_effective_weights(
     if spec.calibration.log_downweighted_axes:
         for axis in spec.trust_axes:
             kappa = kappa_per_axis.get(axis.name, 1.0)
-            if kappa < 1.0 and axis.weight > 0:
+            if kappa < min_kappa and axis.weight > 0:
                 logger.info(
                     "Axis downweighted",
                     extra={

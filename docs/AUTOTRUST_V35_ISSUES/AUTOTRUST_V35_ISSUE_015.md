@@ -35,3 +35,6 @@ Use a more targeted approach:
 
 ## Affected Files
 - `train.py`
+
+## Status: Fixed
+Replaced greedy regex with `_extract_json()` method that uses balanced-brace matching to find the first complete JSON object. All tests pass.

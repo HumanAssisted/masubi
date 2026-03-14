@@ -49,3 +49,6 @@ This means all log output is unstructured text, not machine-parseable JSON. The 
 - `autotrust/providers/anthropic.py`
 - `train.py`
 - `run_loop.py`
+
+## Status: Fixed
+Added `configure_structlog()` in `observe.py` with JSON output, ISO timestamps, and log level. Replaced `import logging; logger = logging.getLogger(__name__)` with `import structlog; logger = structlog.get_logger()` in all 8 modules. Ollama provider uses BaseProvider logging (unchanged). All 103 tests pass.

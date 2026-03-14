@@ -7,8 +7,9 @@ Produces structured ScorerOutput with trust_vector (dict) and Explanation
 from __future__ import annotations
 
 import json
-import logging
 from typing import TYPE_CHECKING
+
+import structlog
 
 from autotrust.schemas import Explanation, ScorerOutput
 
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
     from autotrust.providers import ScoringProvider, TrainingProvider
     from autotrust.schemas import EmailChain
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 class EmailTrustScorer:
@@ -133,14 +134,10 @@ JSON:"""
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            # Try to extract JSON from response
-            import re
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                data = json.loads(match.group())
-            else:
+            # Try to extract JSON using balanced-brace matching
+            data = self._extract_json(raw)
+            if data is None:
                 logger.error("Failed to parse response as JSON: %s", raw[:200])
-                # Return default scores
                 return self._default_output()
 
         trust_vector = data.get("trust_vector", {})
@@ -164,6 +161,33 @@ JSON:"""
         )
 
         return ScorerOutput(trust_vector=trust_vector, explanation=explanation)
+
+    @staticmethod
+    def _extract_json(raw: str) -> dict | None:
+        """Extract JSON object from raw text using balanced-brace matching.
+
+        Finds the first '{' and walks forward counting braces to find the
+        matching '}'. Avoids the greedy regex pitfall of matching the first
+        '{' to the last '}' in the entire response.
+        """
+        try:
+            start = raw.index("{")
+        except ValueError:
+            return None
+
+        depth = 0
+        for i in range(start, len(raw)):
+            ch = raw[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(raw[start : i + 1])
+                except json.JSONDecodeError:
+                    return None
+        return None
 
     def _default_output(self) -> ScorerOutput:
         """Return default output when parsing fails."""

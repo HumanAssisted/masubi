@@ -33,3 +33,6 @@ Update `RunArtifacts.metrics_json` field name/type accordingly, and update `test
 - `autotrust/observe.py`
 - `autotrust/schemas.py` (RunArtifacts field name if changed)
 - `tests/test_observe.py`
+
+## Status: Fixed
+Changed `log_experiment()` to append to `metrics.jsonl` instead of overwriting `metrics.json`. Updated `finalize_run()` to reference `metrics.jsonl`. Updated test to verify two experiments both persist. All tests pass.

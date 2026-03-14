@@ -36,3 +36,6 @@ Alternatively, keep validation external but document clearly that it must be cal
 
 ## Affected Files
 - `autotrust/schemas.py`
+
+## Status: Fixed
+Added `@model_validator(mode="after")` to `ScorerOutput` that calls `validate_trust_vector()` when the spec singleton is loaded. Avoids circular imports by checking `_spec is not None`. All tests pass.

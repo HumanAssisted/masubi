@@ -30,3 +30,6 @@ Additionally, `dual_judge()` calls `get_spec()` from the global singleton to get
 
 ## Affected Files
 - `autotrust/providers/anthropic.py`
+
+## Status: Fixed
+Extracted `_judge_with_model()` private method with retry decorator. Both `judge()` and `dual_judge()` now delegate to it. `dual_judge()` accepts optional `axes` parameter, falling back to spec only when not provided. All tests pass.

@@ -63,25 +63,30 @@ def test_composite_continuous_uses_recall(spec):
 
 
 def test_composite_formula_matches_weights(spec, perfect_calibration, per_axis_scores):
-    """composite = sum(weight_i * metric_i) + penalties."""
+    """composite = sum(weight_i * metric_i) + penalty_weight * fp_rate."""
     from autotrust.eval import compute_composite
 
-    composite = compute_composite(per_axis_scores, spec, perfect_calibration)
+    fp_rate = 0.3
+    composite = compute_composite(per_axis_scores, spec, perfect_calibration, fp_rate=fp_rate)
     expected = sum(a.weight * per_axis_scores[a.name] for a in spec.trust_axes)
-    # Apply composite penalties
-    for penalty in spec.composite_penalties.values():
-        expected += penalty
+    # Apply composite penalties proportionally
+    fp_penalty_weight = spec.composite_penalties.get("false_positive_rate", 0.0)
+    expected += fp_penalty_weight * fp_rate
     assert abs(composite - expected) < 1e-6
 
 
 def test_composite_penalties_applied(spec, perfect_calibration, per_axis_scores):
-    """false_positive_rate penalty reduces composite."""
+    """false_positive_rate penalty reduces composite when FP rate > 0."""
     from autotrust.eval import compute_composite
 
-    composite = compute_composite(per_axis_scores, spec, perfect_calibration)
-    # Without penalties it would be sum(w*0.9) = 0.9
-    # With false_positive_rate: -0.15, composite should be 0.9 - 0.15 = 0.75
-    assert composite < 0.9
+    # With fp_rate=0.0 (default), no penalty applied
+    composite_no_fp = compute_composite(per_axis_scores, spec, perfect_calibration, fp_rate=0.0)
+    # With fp_rate=1.0, full penalty: -0.15 * 1.0 = -0.15
+    composite_full_fp = compute_composite(per_axis_scores, spec, perfect_calibration, fp_rate=1.0)
+    assert composite_full_fp < composite_no_fp
+    # The difference should be the penalty weight * fp_rate
+    fp_penalty = spec.composite_penalties.get("false_positive_rate", 0.0)
+    assert abs((composite_full_fp - composite_no_fp) - fp_penalty) < 1e-6
 
 
 def test_composite_zero_weighted_axis(spec, perfect_calibration):

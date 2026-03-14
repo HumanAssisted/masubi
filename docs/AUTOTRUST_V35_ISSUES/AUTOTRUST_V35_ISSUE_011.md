@@ -35,3 +35,6 @@ def gold_regression_gate(predictions, gold_set, previous_best, spec):
 
 ## Affected Files
 - `autotrust/eval.py`
+
+## Status: Fixed
+Replaced inline metric dispatch in `gold_regression_gate()` with a call to `score_predictions()`. All tests pass.

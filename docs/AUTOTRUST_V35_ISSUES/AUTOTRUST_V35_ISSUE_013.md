@@ -22,3 +22,6 @@ uv run pytest tests/test_composite_metric.py -v
 
 ## Affected Files
 - `README.md`
+
+## Status: Fixed
+Changed `tests/test_eval.py` reference to `tests/test_composite_metric.py` which is an actual test file.

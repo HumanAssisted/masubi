@@ -39,3 +39,6 @@ Update callers to pass `fp_rate` computed from predictions vs ground truth.
 - `autotrust/eval.py`
 - `run_loop.py` (caller)
 - `tests/test_composite_metric.py`
+
+## Status: Fixed
+Changed `compute_composite()` to accept `fp_rate: float = 0.0` parameter and apply penalty weight proportionally (`fp_penalty_weight * fp_rate`). Updated tests to verify proportional penalty application. All tests pass.

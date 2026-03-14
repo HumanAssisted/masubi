@@ -10,15 +10,16 @@ Four provider roles:
 from __future__ import annotations
 
 import functools
-import logging
 import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
+import structlog
+
 if TYPE_CHECKING:
     from autotrust.config import Spec
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +38,30 @@ class BudgetExceededError(ProviderError):
 # Retry decorator
 # ---------------------------------------------------------------------------
 
+def _build_transient_errors() -> tuple[type[Exception], ...]:
+    """Build tuple of transient exception types, including API-specific ones if available."""
+    errors: list[type[Exception]] = [ConnectionError, TimeoutError, OSError]
+    try:
+        import openai
+        errors.extend([openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError])
+    except (ImportError, AttributeError):
+        pass
+    try:
+        import anthropic
+        errors.extend([anthropic.RateLimitError, anthropic.InternalServerError, anthropic.APITimeoutError])
+    except (ImportError, AttributeError):
+        pass
+    try:
+        import httpx
+        errors.append(httpx.HTTPStatusError)
+    except (ImportError, AttributeError):
+        pass
+    return tuple(errors)
+
+
+TRANSIENT_ERRORS = _build_transient_errors()
+
+
 def retry_on_error(max_retries: int = 3, base_delay: float = 1.0, max_delay: float = 30.0):
     """Decorator that retries on transient errors with exponential backoff."""
     def decorator(fn):
@@ -46,7 +71,7 @@ def retry_on_error(max_retries: int = 3, base_delay: float = 1.0, max_delay: flo
             for attempt in range(max_retries):
                 try:
                     return fn(*args, **kwargs)
-                except (ConnectionError, TimeoutError, OSError) as exc:
+                except TRANSIENT_ERRORS as exc:
                     last_exc = exc
                     if attempt < max_retries - 1:
                         delay = min(base_delay * (2 ** attempt), max_delay)

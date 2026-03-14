@@ -8,13 +8,23 @@ enforces budget/time limits, and logs everything.
 from __future__ import annotations
 
 import json
-import logging
+import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from autotrust.config import get_spec
+from autotrust.eval import (
+    compute_composite,
+    explanation_gate,
+    explanation_quality,
+    gold_regression_gate,
+    keep_or_discard,
+    score_predictions,
+)
 from autotrust.observe import (
     finalize_run,
     log_experiment,
@@ -26,7 +36,7 @@ from autotrust.schemas import (
     ExperimentResult,
 )
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 # ---------------------------------------------------------------------------
@@ -122,17 +132,82 @@ Remember to auto-terminate GPUs when done.
     return prompt
 
 
+def _call_agent(prompt: str, spec: Any) -> str | None:
+    """Call Anthropic Sonnet with tool-use to propose train.py edits.
+
+    Returns the proposed new content for train.py, or None if no edit proposed.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        logger.warning("No ANTHROPIC_API_KEY set. Cannot call agent.")
+        return None
+
+    try:
+        import anthropic
+    except ImportError:
+        logger.error("anthropic package not installed.")
+        return None
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    # Use tool-use to get structured edits
+    tools = [
+        {
+            "name": "edit_train_py",
+            "description": "Replace the contents of train.py with new code.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "new_content": {
+                        "type": "string",
+                        "description": "The complete new content for train.py",
+                    },
+                },
+                "required": ["new_content"],
+            },
+        },
+    ]
+
+    response = client.messages.create(
+        model=spec.providers.judge_secondary.model,  # Use Sonnet for agent
+        max_tokens=4096,
+        tools=tools,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    # Extract tool use from response
+    for block in response.content:
+        if hasattr(block, "type") and block.type == "tool_use":
+            if block.name == "edit_train_py":
+                return block.input.get("new_content")
+
+    logger.info("Agent did not propose any edits.")
+    return None
+
+
 def _handle_keep_discard(keep: bool, experiment_num: int) -> None:
     """Handle git keep/discard for train.py."""
     if keep:
-        subprocess.run(["git", "add", "train.py"], check=False)
-        subprocess.run(
-            ["git", "commit", "-m", f"experiment {experiment_num}: keep"],
-            check=False,
+        result = subprocess.run(
+            ["git", "add", "train.py"], capture_output=True, text=True,
         )
+        if result.returncode != 0:
+            logger.error("git add failed: %s", result.stderr)
+            return
+        result = subprocess.run(
+            ["git", "commit", "-m", f"experiment {experiment_num}: keep"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            logger.error("git commit failed: %s", result.stderr)
+            return
         logger.info("Experiment %d: KEPT (committed train.py)", experiment_num)
     else:
-        subprocess.run(["git", "checkout", "--", "train.py"], check=False)
+        result = subprocess.run(
+            ["git", "checkout", "--", "train.py"], capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            logger.error("git checkout failed: %s", result.stderr)
         logger.info("Experiment %d: DISCARDED (restored train.py)", experiment_num)
 
 
@@ -160,15 +235,15 @@ def run_autoresearch(max_experiments: int = 50) -> None:
     4. Finalize run
     """
     spec = get_spec()
-    _calibration = load_calibration()  # noqa: F841 -- used in full implementation
+    calibration = load_calibration()
     run_ctx = start_run(spec)
 
     eval_chains = load_eval_chains()
-    _gold_chains = load_gold_chains()  # noqa: F841 -- used in full implementation
+    gold_chains = load_gold_chains()
 
-    _has_baseline = False  # noqa: F841 -- used in full implementation
-    _prev_best_composite = 0.0  # noqa: F841 -- used in full implementation
-    _prev_best_per_axis: dict[str, float] = {}  # noqa: F841 -- used in full implementation
+    has_baseline = False
+    prev_best_composite = 0.0
+    prev_best_per_axis: dict[str, float] = {}
     consecutive_no_improvement = 0
     total_cost = 0.0
     all_results: list[dict] = []
@@ -199,15 +274,117 @@ def run_autoresearch(max_experiments: int = 50) -> None:
             program_md, train_py, all_results, consecutive_no_improvement
         )
 
-        # In production: call Sonnet via Anthropic API with tool-use
-        # For now, use current train.py as-is (agent editing is external)
-        logger.info("Agent prompt built (%d chars). Awaiting edit.", len(prompt))
+        # --- Call Anthropic Sonnet to propose train.py edits ---
+        experiment_cost = 0.0
+        try:
+            proposed_edit = _call_agent(prompt, spec)
+            experiment_cost += 0.01  # estimated per-call cost
+        except Exception as exc:
+            logger.error("Agent call failed: %s", exc)
+            consecutive_no_improvement += 1
+            continue
 
-        # Score eval chains using current train.py
-        # This would be done after the agent edits train.py
-        # For now, we break -- the actual loop requires real LLM calls
-        logger.info("Experiment loop requires LLM agent. Exiting placeholder loop.")
-        break
+        # Apply proposed edit to train.py
+        if proposed_edit and proposed_edit.strip() != train_py.strip():
+            Path("train.py").write_text(proposed_edit)
+            change_desc = f"Agent edit (experiment {experiment_num})"
+        else:
+            change_desc = f"No change proposed (experiment {experiment_num})"
+            logger.info("Agent proposed no change. Skipping scoring.")
+            consecutive_no_improvement += 1
+            continue
+
+        # --- Score eval chains using modified train.py ---
+        try:
+            from train import EmailTrustScorer
+            from autotrust.providers import get_provider
+
+            scorer_provider = get_provider("scorer", spec)
+            scorer = EmailTrustScorer(provider=scorer_provider, spec=spec)
+            outputs = scorer.score_batch(eval_chains)
+            experiment_cost += 0.02 * len(eval_chains)  # estimated scoring cost
+        except Exception as exc:
+            logger.error("Scoring failed: %s", exc)
+            # Restore train.py on failure
+            Path("train.py").write_text(train_py)
+            consecutive_no_improvement += 1
+            continue
+
+        # --- Three-gate evaluation ---
+        predictions = [o.trust_vector for o in outputs]
+        ground_truth = [c.labels for c in eval_chains]
+        explanations = [o.explanation for o in outputs]
+
+        # Gate 1: Composite score
+        per_axis_metrics = score_predictions(predictions, ground_truth, spec)
+
+        # Compute FP rate for binary axes (phish)
+        phish_preds = [1 if p.get("phish", 0) >= 0.5 else 0 for p in predictions]
+        phish_truth = [1 if t.get("phish", 0) >= 0.5 else 0 for t in ground_truth]
+        fp_count = sum(1 for p, t in zip(phish_preds, phish_truth) if p == 1 and t == 0)
+        neg_count = sum(1 for t in phish_truth if t == 0)
+        fp_rate = fp_count / neg_count if neg_count > 0 else 0.0
+
+        composite = compute_composite(per_axis_metrics, spec, calibration, fp_rate=fp_rate)
+        composite_improved = composite > prev_best_composite
+
+        # Gate 2: Gold-set veto
+        if gold_chains:
+            gold_ok, gold_deltas = gold_regression_gate(
+                predictions, gold_chains, prev_best_per_axis, spec
+            )
+        else:
+            gold_ok = True
+            gold_deltas = {}
+
+        # Gate 3: Explanation gate
+        expl_quality = explanation_quality(explanations, predictions, spec)
+        expl_ok, expl_mode = explanation_gate(expl_quality, spec, has_baseline)
+
+        # Keep/discard decision
+        keep = keep_or_discard(composite_improved, gold_ok, expl_ok)
+
+        # --- Git keep/discard ---
+        _handle_keep_discard(keep, experiment_num)
+
+        if keep:
+            prev_best_composite = composite
+            prev_best_per_axis = per_axis_metrics
+            has_baseline = True
+            consecutive_no_improvement = 0
+        else:
+            consecutive_no_improvement += 1
+
+        # --- Log experiment ---
+        total_cost += experiment_cost
+        elapsed = time.time() - start_time
+
+        result = ExperimentResult(
+            run_id=run_ctx.run_id,
+            change_description=change_desc,
+            per_axis_scores=per_axis_metrics,
+            composite=composite,
+            fp_rate=fp_rate,
+            judge_agreement=0.0,
+            gold_agreement=sum(gold_deltas.values()) / len(gold_deltas) if gold_deltas else 0.0,
+            explanation_quality=expl_quality,
+            downweighted_axes=calibration.flagged_axes,
+            gate_results={
+                "composite": composite_improved,
+                "gold": gold_ok,
+                "explanation": expl_ok,
+            },
+            cost=experiment_cost,
+            wall_time=elapsed,
+        )
+
+        _log_iteration(run_ctx, result)
+        all_results.append(result.model_dump())
+
+        logger.info(
+            "Experiment %d: composite=%.4f, keep=%s, gates=%s",
+            experiment_num, composite, keep, result.gate_results,
+        )
 
     finalize_run(run_ctx)
     logger.info("Autoresearch loop complete. %d experiments run.", len(all_results))

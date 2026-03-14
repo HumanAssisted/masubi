@@ -8,9 +8,9 @@ Three gates (all must pass):
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
 
+import structlog
 from sklearn.metrics import f1_score, recall_score
 
 from autotrust.config import get_effective_weights
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from autotrust.providers import JudgeProvider
     from autotrust.schemas import CalibrationReport, Explanation
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 # ---------------------------------------------------------------------------
@@ -86,10 +86,13 @@ def compute_composite(
     per_axis: dict[str, float],
     spec: Spec,
     calibration: CalibrationReport,
+    fp_rate: float = 0.0,
 ) -> float:
     """Compute composite score using Kappa-adjusted weights + penalties.
 
     Uses get_effective_weights() from config.py for downweighting.
+    Composite penalties scale with actual metrics (e.g., false_positive_rate
+    penalty weight is multiplied by the actual FP rate).
     """
     effective_weights = get_effective_weights(spec, calibration.per_axis_kappa)
 
@@ -98,9 +101,10 @@ def compute_composite(
         for axis in spec.trust_axes
     )
 
-    # Apply composite penalties
-    for penalty_value in spec.composite_penalties.values():
-        composite += penalty_value
+    # Apply composite penalties proportionally
+    # Each penalty value acts as a weight on the corresponding metric
+    fp_penalty_weight = spec.composite_penalties.get("false_positive_rate", 0.0)
+    composite += fp_penalty_weight * fp_rate
 
     return composite
 
@@ -116,15 +120,8 @@ def gold_regression_gate(
     NO Kappa downweighting. Checks ALL axes including zero-weighted ones.
     Returns (passed, per_axis_delta). Veto if ANY axis degrades.
     """
-    # Compute per-axis agreement between predictions and gold set
-    current_performance: dict[str, float] = {}
-    for axis in spec.trust_axes:
-        if axis.type == "binary":
-            current_performance[axis.name] = compute_f1(predictions, gold_set, axis.name)
-        elif axis.metric == "recall":
-            current_performance[axis.name] = compute_recall(predictions, gold_set, axis.name)
-        else:
-            current_performance[axis.name] = compute_agreement(predictions, gold_set, axis.name)
+    # Reuse score_predictions for metric dispatch (DRY)
+    current_performance = score_predictions(predictions, gold_set, spec)
 
     # Compute deltas against previous best
     deltas: dict[str, float] = {}

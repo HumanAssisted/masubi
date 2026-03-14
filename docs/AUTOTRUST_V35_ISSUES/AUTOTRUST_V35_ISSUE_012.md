@@ -31,3 +31,6 @@ If the DummyScorer's fixed scores don't guarantee some axes above threshold, adj
 
 ## Affected Files
 - `tests/test_smoke.py`
+
+## Status: Fixed
+Changed DummyScorer to use scores of 0.8 (above flag_threshold) so axes are always flagged. Removed conditional assertion and made both the quality and gate assertions unconditional. Test passes.

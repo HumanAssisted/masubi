@@ -38,3 +38,6 @@ Or, accept a configurable `retryable_exceptions` parameter in the decorator.
 
 ## Affected Files
 - `autotrust/providers/__init__.py`
+
+## Status: Fixed
+Added `_build_transient_errors()` that dynamically includes openai, anthropic, and httpx error types when available. The `TRANSIENT_ERRORS` tuple is built at import time. All provider tests pass.

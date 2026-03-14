@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 if TYPE_CHECKING:
     from autotrust.config import Spec
@@ -76,6 +76,18 @@ class Explanation(BaseModel):
 class ScorerOutput(BaseModel):
     trust_vector: dict[str, float]
     explanation: Explanation
+
+    @model_validator(mode="after")
+    def _validate_trust_vector(self) -> ScorerOutput:
+        """Validate trust_vector keys against spec.yaml axis names at construction time.
+
+        Only validates when the spec singleton is already loaded (avoids
+        circular imports and allows test fixtures to construct without a spec).
+        """
+        from autotrust.config import _spec
+        if _spec is not None:
+            validate_trust_vector(self.trust_vector, _spec)
+        return self
 
 
 # ---------------------------------------------------------------------------

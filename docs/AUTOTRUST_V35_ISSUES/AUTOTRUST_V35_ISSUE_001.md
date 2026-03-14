@@ -30,3 +30,6 @@ This is the single most critical missing piece -- without it, the entire system 
 
 ## Affected Files
 - `run_loop.py`
+
+## Status: Fixed
+Implemented the full experiment loop body: `_call_agent()` calls Anthropic Sonnet with tool-use for train.py edits, scoring via `EmailTrustScorer`, three-gate evaluation (composite with FP rate, gold-set veto, explanation gate), git keep/discard with proper error handling, cost/time tracking, LoRA nudge after 3 stalls, and `ExperimentResult` logging. Removed all `noqa: F841` annotations and the placeholder break. All 6 run_loop tests pass.

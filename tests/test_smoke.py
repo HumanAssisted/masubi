@@ -249,7 +249,10 @@ def test_smoke_explanation_warn_mode(spec, axis_names, perfect_calibration):
 
 def test_smoke_explanation_gate_mode_blocks(spec, axis_names, perfect_calibration):
     """After baseline, bad explanation quality -> discard."""
-    scorer = DummyScorer(spec, reasons=[])  # no reasons -> quality = 0
+    # Use scores above flag_threshold (0.5) so axes get flagged,
+    # but provide no reasons -- quality should be 0.0
+    high_scores = {a: 0.8 for a in axis_names}
+    scorer = DummyScorer(spec, trust_vector=high_scores, reasons=[])
     eval_chains = make_eval_set(10, axis_names)
     outputs = scorer.score_batch(eval_chains)
 
@@ -260,9 +263,11 @@ def test_smoke_explanation_gate_mode_blocks(spec, axis_names, perfect_calibratio
     expl_ok, mode = explanation_gate(expl_quality_val, spec, has_baseline=True)
 
     assert mode == "gate"
-    # Some predictions have scores > 0.5 but no reasons -> quality < 0.5
-    if expl_quality_val < spec.explanation.min_quality_threshold:
-        assert expl_ok is False
+    # All axes score > 0.5 but no reasons -> quality should be 0.0
+    assert expl_quality_val < spec.explanation.min_quality_threshold, (
+        f"Expected quality < {spec.explanation.min_quality_threshold}, got {expl_quality_val}"
+    )
+    assert expl_ok is False
 
 
 def test_smoke_structured_output_validation(spec, axis_names):

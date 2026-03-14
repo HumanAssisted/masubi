@@ -56,7 +56,7 @@ All configuration lives in `spec.yaml`:
 uv run pytest -v
 
 # Run specific test file
-uv run pytest tests/test_eval.py -v
+uv run pytest tests/test_composite_metric.py -v
 
 # Lint
 uv run ruff check .

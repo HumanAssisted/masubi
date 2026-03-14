@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-import logging
 import random
 from typing import Any
 
+import structlog
+
 from autotrust.providers import JudgeProvider, retry_on_error
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 class AnthropicJudge(JudgeProvider):
@@ -64,14 +65,17 @@ JSON scores:"""
         return prompt
 
     @retry_on_error(max_retries=3, base_delay=1.0)
-    def judge(self, chain: Any, axes: list[str]) -> dict[str, float]:
-        """Judge a chain on specified axes using the primary model."""
-        self._log_call("judge", axes=axes)
+    def _judge_with_model(self, chain: Any, axes: list[str], model: str) -> dict[str, float]:
+        """Judge a chain on specified axes using a given model.
+
+        Shared implementation for both primary and secondary judge calls.
+        """
+        self._log_call("_judge_with_model", axes=axes, model=model)
         prompt = self._build_judge_prompt(chain, axes)
         client = self._get_client()
 
         response = client.messages.create(
-            model=self.primary_model,
+            model=model,
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -85,32 +89,26 @@ JSON scores:"""
             result[axis] = max(0.0, min(1.0, float(val)))
         return result
 
-    def dual_judge(self, chain: Any) -> tuple[dict[str, float], dict[str, float], float]:
+    def judge(self, chain: Any, axes: list[str]) -> dict[str, float]:
+        """Judge a chain on specified axes using the primary model."""
+        return self._judge_with_model(chain, axes, self.primary_model)
+
+    def dual_judge(self, chain: Any, axes: list[str] | None = None) -> tuple[dict[str, float], dict[str, float], float]:
         """Judge with both primary and secondary models, compute agreement.
+
+        Args:
+            chain: The email chain to judge.
+            axes: Axis names to judge on. If None, uses all axes from spec.
 
         Returns: (primary_scores, secondary_scores, agreement)
         Agreement = 1.0 - mean(|primary - secondary|) across axes.
         """
-        from autotrust.config import get_spec
-        spec = get_spec()
-        axes = [a.name for a in spec.trust_axes]
+        if axes is None:
+            from autotrust.config import get_spec
+            axes = [a.name for a in get_spec().trust_axes]
 
-        primary_scores = self.judge(chain, axes)
-
-        # Secondary judge call
-        prompt = self._build_judge_prompt(chain, axes)
-        client = self._get_client()
-        response = client.messages.create(
-            model=self.secondary_model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.content[0].text
-        raw_secondary = json.loads(text)
-        secondary_scores = {
-            axis: max(0.0, min(1.0, float(raw_secondary.get(axis, 0.0))))
-            for axis in axes
-        }
+        primary_scores = self._judge_with_model(chain, axes, self.primary_model)
+        secondary_scores = self._judge_with_model(chain, axes, self.secondary_model)
 
         # Agreement: 1.0 - mean absolute difference
         diffs = [abs(primary_scores[a] - secondary_scores[a]) for a in axes]
