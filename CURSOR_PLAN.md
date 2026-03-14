@@ -1,27 +1,27 @@
 ---
-name: AutoEmailTrust v3.4 Lean
-overview: "AutoEmailTrust v3.4: lean autoresearch loop with 3 layers -- spec.yaml as single source of truth, fixed platform (provider registry + per-backend modules, data, eval, observability), and train.py as the only mutable file. Kappa-proportional downweighting for poorly-calibrated axes. Explanation quality as composite gate. Gold-set veto explicitly documented for agent."
+name: AutoEmailTrust v3.5 Lean
+overview: "AutoEmailTrust v3.5: lean autoresearch loop with 3 layers. spec.yaml as single source of truth with structured axis definitions (name/type/metric/weight), axis_groups for eval dispatch, composite_penalties separated from axis weights. TrustVector as dict[str, float] validated against spec. Explanation gate with warn_then_gate mode. Kappa downweighting for composite only; gold-set veto always uses raw human labels. Structured explanation output (not CoT extraction)."
 todos:
   - id: scaffold
-    content: "Create pyproject.toml (uv, Python 3.12), .env.example, .gitignore, spec.yaml (trust axes, composite weights, provider bindings, limits, judge thresholds, calibration policy)"
+    content: "Create pyproject.toml (uv, Python 3.12), .env.example, .gitignore, spec.yaml with structured trust_axes, axis_groups, composite_penalties, providers, limits, judge, calibration, explanation, safety, data"
     status: pending
   - id: annotation-rubric
-    content: "Write annotation_rubric.md: per-axis definitions with examples at 0.0/0.5/1.0, binary axis criteria, edge case guidance, inter-annotator instructions"
+    content: "Write annotation_rubric.md: per-axis definitions with examples at 0.0/0.5/1.0, binary axis criteria, edge case guidance, inter-annotator instructions. Must exist BEFORE any data generation."
     status: pending
   - id: core-platform
-    content: "Build config.py (typed spec.yaml loader), schemas.py (pydantic models), providers/__init__.py (registry + base classes), providers/ollama.py, providers/hyperbolic.py, providers/anthropic.py"
+    content: "Build config.py (typed spec.yaml loader with axis/weight validation), schemas.py (pydantic models, TrustVector as dict[str,float] validated against spec), providers/ (registry + ollama.py, hyperbolic.py, anthropic.py)"
     status: pending
   - id: core-tests
-    content: "TDD: write unit + contract tests for config, schemas, providers before implementation"
+    content: "TDD: unit + contract tests for config (axis-weight consistency, Kappa downweight math), schemas (round-trip, validation), providers (per-backend mocks)"
     status: pending
   - id: data-eval
-    content: "Build data.py (subcommands: build-train, build-eval, build-gold, annotate-export, calibrate-judge) and eval.py (composite with Kappa-proportional weights, judge fallback, gold-set veto gate, explanation quality gate)"
+    content: "Build data.py (subcommands: build-train, build-eval, build-gold, annotate-export, calibrate-judge) and eval.py (composite via axis type dispatch, Kappa downweight for composite only, gold-set veto on raw labels, explanation gate with warn_then_gate)"
     status: pending
   - id: data-eval-tests
-    content: "TDD: write unit tests for composite metric (including downweighting), escalation rules, safety filter, gold gate, explanation quality gate"
+    content: "TDD: unit tests for composite metric (binary->F1, continuous->agreement auto-dispatch), Kappa downweighting, escalation rules, safety filter, gold gate (raw labels, no downweighting), explanation gate (flag_threshold, modes)"
     status: pending
   - id: observe
-    content: "Build observe.py: structured logging (structlog), runs/<run_id>/ directory, calibration warnings in logs"
+    content: "Build observe.py: structured logging (structlog), runs/<run_id>/ directory, calibration + downweight warnings"
     status: pending
   - id: gold-set-gen
     content: "Generate gold-set candidates: uv run python -m autotrust.data build-gold"
@@ -30,32 +30,32 @@ todos:
     content: "HUMAN STEP: annotate 200 chains (2-3 annotators), run calibrate-judge, review Kappa per axis"
     status: pending
   - id: train
-    content: "Build train.py baseline: thread-aware EmailTrustScorer, explanation output, inference via ScoringProvider, LoRA scaffolding via TrainingProvider"
+    content: "Build train.py baseline: thread-aware EmailTrustScorer with structured explanation output (reasons array + summary), inference via ScoringProvider, LoRA scaffolding via TrainingProvider"
     status: pending
   - id: run-loop
     content: "Build run_loop.py: thin Anthropic tool-use orchestration, delegates to eval.py (composite + gold veto + explanation gate), observe.py for logging, git keep/discard"
     status: pending
   - id: smoke-tests
-    content: "Smoke tests: 10-chain eval + 10-chain gold, 1 full loop cycle with dummy train.py, verify git commit/discard + explanation gate"
+    content: "Smoke tests: 10-chain eval + 10-chain gold, 1 full loop cycle with dummy train.py, verify three-gate keep/discard + explanation gate modes"
     status: pending
   - id: docs
-    content: "Write program.md (tiny, explains gold-set veto and explanation gate) and update README.md"
+    content: "Write program.md (tiny, explains three-gate policy + structured explanation contract) and update README.md"
     status: pending
 isProject: false
 ---
 
-# AutoEmailTrust v3.4 Lean
+# AutoEmailTrust v3.5 Lean
 
-Updates from v3.3: (1) providers.py split into registry + per-backend modules, (2) Kappa-proportional downweighting for poorly-calibrated axes, (3) explanation quality as a composite gate, (4) gold-set veto behavior made explicit in program.md, (5) annotation_rubric.md moved before any data generation in execution order.
+Updates from v3.4: (1) Fixed axis/weight naming mismatch -- trust_axes are now structured objects with name/type/metric/weight, composite_penalties is a separate section, (2) axis_groups encode binary/continuous/subtle/fast groupings in spec, (3) TrustVector is `dict[str, float]` validated against spec (not dynamic pydantic), (4) explanation gate supports `warn_then_gate` mode, (5) Kappa downweighting explicitly scoped to composite only -- gold-set veto always uses raw human labels, (6) explanation quality concretely defined as flagged-axis coverage, (7) train.py emits structured explanation (reasons array) not CoT extraction.
 
 ## 3-Layer Architecture
 
 ```mermaid
 flowchart TD
     subgraph specLayer [Layer 1: Spec/Config]
-        Spec["spec.yaml\n(single source of truth)"]
-        Config["config.py\n(typed loader)"]
-        Schemas["schemas.py\n(pydantic models)"]
+        Spec["spec.yaml\n(structured axes, groups,\npenalties, providers)"]
+        Config["config.py\n(typed loader + validation)"]
+        Schemas["schemas.py\n(pydantic models,\ndict-based TrustVector)"]
         Spec --> Config
         Config --> Schemas
     end
@@ -67,7 +67,7 @@ flowchart TD
         ProvHyp["providers/hyperbolic.py"]
         ProvAnth["providers/anthropic.py"]
         Data["data.py\n(build-train, build-eval,\nbuild-gold, calibrate-judge)"]
-        EvalMod["eval.py\n(composite, judge fallback,\ngold-set veto, explanation gate)"]
+        EvalMod["eval.py\n(auto-dispatch by axis type,\ngold veto on raw labels,\nexplanation gate)"]
         Observe["observe.py\n(structured logs, run artifacts)"]
         ProvReg --> ProvOllama
         ProvReg --> ProvHyp
@@ -75,7 +75,7 @@ flowchart TD
     end
 
     subgraph mutableLayer [Layer 3: Mutable Model]
-        TrainPy["train.py\n(ONLY agent-editable file)"]
+        TrainPy["train.py\n(ONLY agent-editable file)\n(structured explanation output)"]
     end
 
     RunLoop["run_loop.py\n(thin orchestration)"]
@@ -102,11 +102,11 @@ autoresearch-helpful/
 ├── pyproject.toml
 ├── .env.example
 ├── .gitignore
-├── spec.yaml                    # single source of truth
+├── spec.yaml                    # single source of truth (structured axes)
 ├── autotrust/
 │   ├── __init__.py
-│   ├── config.py                # typed settings loader
-│   ├── schemas.py               # pydantic models
+│   ├── config.py                # typed settings loader + validation
+│   ├── schemas.py               # pydantic models (dict-based TrustVector)
 │   ├── providers/
 │   │   ├── __init__.py          # registry, base classes, get_provider()
 │   │   ├── ollama.py            # GeneratorProvider (local Dolphin 3.0)
@@ -130,41 +130,92 @@ autoresearch-helpful/
 │   └── .gitkeep
 └── tests/
     ├── test_composite_metric.py
+    ├── test_kappa_downweight.py
     ├── test_escalation_rules.py
     ├── test_safety_filter.py
     ├── test_schema_validation.py
     ├── test_gold_gate.py
     ├── test_explanation_gate.py
-    ├── test_kappa_downweight.py
     ├── test_providers.py         # contract tests (per-backend)
     └── test_smoke.py             # 10-chain eval + 1 loop cycle
 ```
 
 ## `spec.yaml` -- Single Source of Truth
 
+### Structured Axis Definitions
+
+Each axis declares its own name, type, evaluation metric, and composite weight. `eval.py` dispatches automatically: binary axes get F1, continuous axes get agreement. No name-translation layer needed.
+
 ```yaml
 trust_axes:
-  - truthfulness
-  - verify_by_search
-  - manipulation
-  - deceit
-  - vulnerability_risk
-  - subtle_toxicity
-  - polarization
-  - classic_email_metrics
-  - authority_impersonation
+  - name: phish
+    type: binary
+    metric: f1
+    weight: 0.22
+  - name: truthfulness
+    type: continuous
+    metric: agreement
+    weight: 0.18
+  - name: verify_by_search
+    type: binary
+    metric: f1
+    weight: 0.00       # tracked and gated, but zero-weighted until ready
+  - name: manipulation
+    type: continuous
+    metric: agreement
+    weight: 0.13
+  - name: deceit
+    type: continuous
+    metric: recall
+    weight: 0.10
+  - name: vulnerability_risk
+    type: continuous
+    metric: agreement
+    weight: 0.10
+  - name: subtle_toxicity
+    type: continuous
+    metric: agreement
+    weight: 0.08
+  - name: polarization
+    type: continuous
+    metric: agreement
+    weight: 0.05
+  - name: classic_email_metrics
+    type: continuous
+    metric: agreement
+    weight: 0.04
+  - name: authority_impersonation
+    type: continuous
+    metric: agreement
+    weight: 0.10
 
-composite_weights:
-  phish_f1: 0.22
-  truth_agreement: 0.18
-  manipulation: 0.13
-  deceit_recall: 0.10
-  vulnerability_risk: 0.10
-  subtle_toxicity: 0.08
-  polarization: 0.05
-  classic_email_metrics: 0.04
-  authority_impersonation: 0.10
+composite_penalties:
   false_positive_rate: -0.15
+
+axis_groups:
+  binary:
+    - phish
+    - verify_by_search
+  continuous:
+    - truthfulness
+    - manipulation
+    - deceit
+    - vulnerability_risk
+    - subtle_toxicity
+    - polarization
+    - classic_email_metrics
+    - authority_impersonation
+  subtle:
+    - deceit
+    - subtle_toxicity
+    - polarization
+    - vulnerability_risk
+    - authority_impersonation
+  fast:
+    - phish
+    - verify_by_search
+    - manipulation
+    - classic_email_metrics
 
 providers:
   generator:
@@ -193,13 +244,16 @@ judge:
   min_gold_kappa: 0.70
 
 calibration:
-  downweight_policy: kappa_proportional   # axis weight *= actual_kappa / min_gold_kappa
-  redistribute_remainder: true            # unallocated weight spread to passing axes
+  downweight_policy: kappa_proportional
+  redistribute_remainder: true
   log_downweighted_axes: true
+  scope: composite_only             # downweighting NEVER affects gold-set veto
 
 explanation:
-  min_quality_threshold: 0.5              # explanation must score >= 0.5 to pass gate
-  gate_enabled: true                      # if false, explanation quality is logged but not gated
+  mode: warn_then_gate              # warn (log only) -> gate (blocks keep/discard)
+  flag_threshold: 0.5               # axis scores above this are "flagged"
+  min_quality_threshold: 0.5        # explanation quality must be >= this to pass gate
+  gate_after_baseline: true         # gate activates after first successful experiment
 
 safety:
   synth_placeholder_only: true
@@ -213,54 +267,61 @@ data:
   train_val_test_split: [0.70, 0.15, 0.15]
 ```
 
-## Key Policy Decisions (v3.4)
+### What the Structured Spec Fixes
+
+**Before (v3.4):** `composite_weights` had keys like `phish_f1`, `truth_agreement`, `deceit_recall` that didn't match `trust_axes` names. Every consumer needed its own mapping.
+
+**After (v3.5):** Each axis carries its own weight and metric type. `config.py` validates that every axis has a weight, `eval.py` auto-dispatches metric computation by type, and `verify_by_search` is explicitly tracked at weight 0.00 (participates in gold-set veto but doesn't affect composite until promoted).
+
+`composite_penalties` is a separate section for cross-cutting penalties (like `false_positive_rate`) that aren't axis scores.
+
+`axis_groups` encode which axes are binary/continuous/subtle/fast, removing hidden policy from `eval.py`.
+
+## Key Policy Decisions (v3.5)
 
 ### Keep/Discard Decision: Three Gates
 
-An experiment is kept only if ALL three gates pass:
-
 ```
-1. Composite improved?     (weighted score with FP penalty + Kappa downweighting)
-2. Gold-set veto passed?   (no axis degrades vs human consensus labels)
-3. Explanation gate passed? (explanation quality >= min_quality_threshold)
+1. Composite improved?     (Kappa-adjusted axis weights + penalties, auto-dispatched metrics)
+2. Gold-set veto passed?   (raw human labels, NO downweighting, all axes including zero-weighted)
+3. Explanation gate?       (warn_then_gate: logs only until baseline, then blocks)
 ```
 
-The gold-set veto has absolute authority. An experiment can improve composite by +10% but still be rejected if it degrades agreement on any single axis (e.g., subtle_toxicity). This is intentional: the composite score alone is never sufficient for keep/discard. program.md makes this explicit so the agent doesn't chase composite gains that keep getting rejected.
+### Kappa Downweighting: Composite Only
 
-### Kappa-Proportional Downweighting
+- Kappa-proportional downweighting applies to `compute_composite()` only
+- `gold_regression_gate()` always compares against raw human consensus labels
+- The veto never uses downweighted logic -- it checks every axis directly, including zero-weighted ones like `verify_by_search`
+- This means an axis can be downweighted in composite (contributing less to ranking) while still having full veto power via the gold set
 
-When `calibrate-judge` finds an axis with Kappa below `min_gold_kappa`:
+### Explanation Quality: Concrete Definition
 
-- The axis is NOT excluded from composite
-- Its composite weight gets multiplied by `actual_kappa / min_gold_kappa`
-- Example: subtle_toxicity has Kappa 0.55, min is 0.70 -> weight becomes `0.08 * (0.55/0.70) = 0.063`
-- The unallocated weight (0.08 - 0.063 = 0.017) is redistributed proportionally across passing axes
-- Every experiment run logs which axes are downweighted and by how much
-- The axis still participates in the gold-set veto gate (human labels are the reference, not Opus)
-- Likely candidates for downweighting: polarization, subtle_toxicity
+For each axis scoring above `flag_threshold` (0.5), the explanation must contain a semantic reference to that axis:
 
-This avoids the binary "include or exclude" problem -- poorly-calibrated axes contribute less but don't disappear.
+```
+explanation_quality = (axes correctly referenced in explanation) / (axes flagged above threshold)
+```
 
-### Explanation Quality Gate
+- An email with no axes flagged above threshold automatically passes (quality = 1.0)
+- An email with 3 flagged axes where the explanation only mentions 1 gets quality = 0.33
+- The `reasons` array in the structured output is what gets checked -- each reason must map to a flagged axis
 
-Explanation quality is computed by `eval.py` and influences keep/discard:
+### Explanation Gate: `warn_then_gate` Mode
 
-- Measures whether the model's explanation mentions the correct flagged axes
-- Must score >= `min_quality_threshold` (default 0.5) for the experiment to be kept
-- If `gate_enabled: false` in spec.yaml, it's logged but doesn't block
-- This gives the agent an incentive to improve explanations, not just scores
-- The gate is separate from composite -- explanation quality is not a composite weight
+- **Before baseline**: explanation quality is computed and logged but does not block keep/discard
+- **After first successful experiment**: explanation gate becomes hard -- quality must be >= `min_quality_threshold`
+- Rationale: early experiments may produce poor explanations while improving scoring; blocking them too early starves the loop. Once baseline quality is established, the agent must maintain it.
 
-### Composite + FP Penalty Interaction
+### Composite + FP Penalty + Gold Veto Interaction
 
-The `false_positive_rate: -0.15` weight in composite penalizes FP in the score, and the gold gate separately rejects axis regressions. This means an experiment could improve composite (other axes offset the FP penalty) but still be rejected by the gold gate because FP degraded on one axis. This double-check is the intended behavior -- documented in program.md.
+The `false_positive_rate: -0.15` penalty in `composite_penalties` penalizes FP in the composite score. The gold-set veto separately rejects any axis regression. An experiment can improve composite (other axes offset the FP penalty) but still be rejected by the gold gate because FP degraded. This is intentional double-checking, documented in program.md.
 
 ## Implementation Details
 
 ### 1. Scaffold
 
 - **`pyproject.toml`**: Python 3.12, uv-managed. Dependencies:
-  - `anthropic`, `openai` (Hyperbolic uses OpenAI-compatible endpoint), `ollama`
+  - `anthropic`, `openai`, `ollama`
   - `python-dotenv`, `pydantic`, `pyyaml`
   - `gitpython`, `httpx`, `rich`, `structlog`
   - `datasets`, `scikit-learn`
@@ -274,7 +335,7 @@ Written BEFORE any data generation. Defines the semantics of every axis:
 
 - Per-axis definitions with concrete examples at 0.0, 0.5, and 1.0
 - Binary axis criteria (phish: what makes it 0 vs 1; verify_by_search: when to flag)
-- Continuous axis boundary conditions (e.g., legitimate urgency vs manipulative urgency for manipulation; friendly authority vs impersonation for authority_impersonation)
+- Continuous axis boundary conditions (e.g., legitimate urgency vs manipulative urgency; friendly authority vs impersonation)
 - Edge case guidance (multi-intent emails, sarcasm, cultural context)
 - Instructions for annotators: score independently, document uncertainty, flag ambiguous chains
 
@@ -282,19 +343,35 @@ Written BEFORE any data generation. Defines the semantics of every axis:
 
 - `load_spec(path="spec.yaml") -> Spec` -- loads and validates into pydantic model
 - `get_spec() -> Spec` -- cached singleton
-- Validates: provider bindings exist, positive weights sum correctly, axis names consistent, calibration policy valid
-- Loads Kappa calibration data if `gold_set/calibration.json` exists (output of `calibrate-judge`)
-- `get_effective_weights(spec, calibration) -> dict` -- applies Kappa-proportional downweighting and redistribution
+- **Validation at load time:**
+  - Every axis in `trust_axes` has a valid type (`binary` | `continuous`), metric, and weight >= 0
+  - Positive axis weights sum to ~1.0 (before penalties)
+  - All axis names in `axis_groups` exist in `trust_axes`
+  - `composite_penalties` keys are not axis names (they're cross-cutting)
+  - Provider bindings reference known backends
+- `get_effective_weights(spec, calibration) -> dict` -- applies Kappa-proportional downweighting to axis weights, redistributes remainder, returns adjusted weight dict. Only used by `compute_composite()`, never by `gold_regression_gate()`.
 
 ### 4. `schemas.py` -- Pydantic Models
 
 - `Email` -- single message (from, to, subject, body, timestamp, reply_depth)
-- `EmailChain` -- chain with metadata, labels (9 axes), trust_vector, composite, flags
-- `TrustVector` -- 9-dim, axes dynamically built from spec.yaml
-- `ExperimentResult` -- run_id, change_description, per_axis_scores, composite, fp_rate, judge_agreement, gold_agreement, explanation_quality, downweighted_axes, cost, wall_time
+- `EmailChain` -- chain with metadata, labels as `dict[str, float]`, trust_vector as `dict[str, float]`, composite, flags
+- **TrustVector is `scores: dict[str, float]`** -- validated against spec.yaml axis names at construction time, not dynamically generated as a pydantic model
+- `Explanation` -- structured explanation output:
+  ```python
+  class Explanation(BaseModel):
+      reasons: list[str]    # axis names or semantic references
+      summary: str          # human-readable summary
+  ```
+- `ScorerOutput` -- full output from train.py:
+  ```python
+  class ScorerOutput(BaseModel):
+      trust_vector: dict[str, float]
+      explanation: Explanation
+  ```
+- `ExperimentResult` -- run_id, change_description, per_axis_scores, composite, fp_rate, judge_agreement, gold_agreement, explanation_quality, downweighted_axes, gate_results, cost, wall_time
 - `RunArtifacts` -- paths to metrics.json, predictions.jsonl, config.json, summary.txt
 - `GoldChain` -- extends EmailChain with annotator_scores, consensus_labels, kappa, opus_agreement
-- `CalibrationReport` -- per-axis Kappa, effective weights after downweighting, flagged axes
+- `CalibrationReport` -- per-axis Kappa, effective weights, flagged axes, downweight amounts
 
 ### 5. `providers/` -- Registry + Per-Backend Modules
 
@@ -341,7 +418,7 @@ Shared base class handles: retry logic, structured logging, error normalization.
 
 **`providers/anthropic.py`** -- `AnthropicJudge(JudgeProvider)`:
 - Uses `anthropic.Anthropic` client directly
-- `judge()` calls primary model (Opus) with bias-mitigated prompt (position randomization, verbosity normalization)
+- `judge()` calls primary model with bias-mitigated prompt (position randomization, verbosity normalization)
 - `dual_judge()` calls primary then secondary, runs disagreement filter
 - Primary and secondary models configurable via spec.yaml
 
@@ -362,64 +439,104 @@ Internally:
 - Synthetic: Dolphin 3.0 via GeneratorProvider (placeholders only, no operational instructions)
 - Pipeline: seed -> safety filter -> Evol-Instruct -> SpearBot critic -> dual-judge labeling -> dedup
 - `calibrate-judge`: ingests human annotations, computes Cohen's Kappa per axis, writes `gold_set/calibration.json`, logs which axes fall below min_gold_kappa
+- Uses `axis_groups` from spec to determine which axes need judge escalation (subtle group)
 
 ### 7. `eval.py` -- Fixed Evaluation Policy
 
+Auto-dispatches metric computation based on axis type from spec.yaml:
+
 ```python
+def score_predictions(predictions: list, ground_truth: list, spec: Spec) -> dict:
+    """Per-axis metrics. Binary axes -> F1. Continuous axes -> agreement/recall (per axis config)."""
+    for axis in spec.trust_axes:
+        if axis.type == "binary":
+            results[axis.name] = compute_f1(preds, truth, axis.name)
+        elif axis.metric == "recall":
+            results[axis.name] = compute_recall(preds, truth, axis.name)
+        else:
+            results[axis.name] = compute_agreement(preds, truth, axis.name)
+
 def compute_composite(per_axis: dict, spec: Spec, calibration: CalibrationReport) -> float:
-    """Weighted sum using Kappa-adjusted weights. Logs downweighted axes."""
+    """Kappa-adjusted axis weights + composite_penalties. Uses get_effective_weights()."""
 
 def gold_regression_gate(predictions, gold_set, previous_best, spec: Spec) -> tuple[bool, dict]:
-    """Returns (passed, per_axis_delta). Veto if ANY axis degrades."""
+    """Compares against RAW human consensus labels. No Kappa downweighting.
+    Checks ALL axes including zero-weighted ones (e.g., verify_by_search).
+    Returns (passed, per_axis_delta). Veto if ANY axis degrades."""
 
-def explanation_quality_gate(explanations, ground_truth_axes, spec: Spec) -> tuple[bool, float]:
-    """Returns (passed, score). Gate if spec.explanation.gate_enabled and score < threshold."""
+def explanation_quality(explanations: list[Explanation], predictions: list, spec: Spec) -> float:
+    """For each chain: count axes with score > flag_threshold.
+    Check if explanation.reasons references each flagged axis.
+    quality = correctly_referenced / flagged_count.
+    Chains with no flagged axes score 1.0. Returns mean across chains."""
+
+def explanation_gate(quality: float, spec: Spec, has_baseline: bool) -> tuple[bool, str]:
+    """Returns (passed, mode).
+    mode='warn': logs quality but always passes (before baseline).
+    mode='gate': blocks if quality < min_quality_threshold (after baseline)."""
 
 def keep_or_discard(composite_improved: bool, gold_ok: bool, explanation_ok: bool) -> bool:
     """All three must pass."""
 
-def score_predictions(predictions, ground_truth, spec) -> dict
-def run_judge_fallback(chain, fast_scores, judge, spec) -> dict
+def run_judge_fallback(chain, fast_scores, judge: JudgeProvider, spec: Spec) -> dict:
+    """Escalate to judge if any axis in axis_groups.subtle scores > escalate_threshold."""
 ```
 
 ### 8. `observe.py` -- Structured Logging + Run Artifacts
 
 - `structlog` with JSON output
 - `start_run(spec) -> RunContext` -- creates `runs/<run_id>/`, snapshots config + effective weights
-- `log_experiment(ctx, result)` -- writes metrics.json, includes downweighted_axes and gate results
-- `log_predictions(ctx, predictions)` -- predictions.jsonl
+- `log_experiment(ctx, result)` -- writes metrics.json, includes downweighted_axes, gate results (composite/gold/explanation), mode (warn/gate)
+- `log_predictions(ctx, predictions)` -- predictions.jsonl with per-chain trust vectors and explanations
 - `finalize_run(ctx)` -- summary.txt
 - Calibration warnings: logs when axes are downweighted, how much weight was redistributed
 
 ### 9. `train.py` -- The Only Mutable File
 
-- `EmailTrustScorer` with `score_chain()`, `score_batch()`, `explain()`
-- Baseline: thread-aware prompt via ScoringProvider asking about inter-message patterns
-- Thread encoder signals: reply timing, escalation, authority shifts, persuasion progression
-- Explanation output: structured reasons extracted from chain-of-thought
-- LoRA scaffolding: `fine_tune()` and `load_fine_tuned()` as placeholders
+Baseline scorer with structured explanation output:
+
+- `EmailTrustScorer` class:
+  - `score_chain(chain) -> ScorerOutput` -- returns trust vector (dict) + Explanation (reasons + summary)
+  - `score_batch(chains) -> list[ScorerOutput]` -- batch scoring
+- **Structured explanation contract:**
+  ```python
+  {
+      "trust_vector": {"phish": 0.95, "manipulation": 0.7, ...},
+      "explanation": {
+          "reasons": ["authority_impersonation", "urgent_financial_request", "unverifiable_claim"],
+          "summary": "Email impersonates CFO with urgent wire transfer request containing unverifiable details"
+      }
+  }
+  ```
+- The scorer explicitly emits `reasons` as a list -- NOT extracted from hidden chain-of-thought. This is testable and gateable.
+- **Baseline implementation:** thread-aware prompt via ScoringProvider that asks for structured JSON output with both trust_vector and explanation fields
+- **Thread encoder signals:** reply timing, escalation, authority shifts, persuasion progression
+- **LoRA scaffolding:** `fine_tune(data_path, trainer: TrainingProvider)` and `load_fine_tuned(checkpoint)` as placeholders
 - Uses providers -- never constructs clients directly
 
 ### 10. `run_loop.py` -- Thin Orchestration
 
 ```python
 spec = get_spec()
-calibration = load_calibration()  # Kappa data from gold-set step
+calibration = load_calibration()
 run_ctx = start_run(spec)
+has_baseline = False
 
 while experiment_count < max_experiments:
     # 1. Call Sonnet with program.md + train.py + last N results
     # 2. Apply proposed edit to train.py
-    # 3. predictions = score all eval chains via train.py
-    # 4. metrics = eval.score_predictions(predictions, ground_truth, spec)
+    # 3. outputs: list[ScorerOutput] = score all eval chains via train.py
+    # 4. metrics = eval.score_predictions(outputs, ground_truth, spec)
     # 5. composite = eval.compute_composite(metrics, spec, calibration)
-    # 6. gold_ok, gold_deltas = eval.gold_regression_gate(predictions, gold_set, prev_best, spec)
-    # 7. expl_ok, expl_score = eval.explanation_quality_gate(explanations, truth_axes, spec)
-    # 8. keep = eval.keep_or_discard(composite > prev_best, gold_ok, expl_ok)
-    # 9. if keep: git commit, else: git checkout -- train.py
-    # 10. observe.log_experiment(run_ctx, result)
-    # 11. if 3 consecutive no-improvement: nudge toward LoRA
-    # 12. enforce budget/time from spec.limits
+    # 6. gold_ok, gold_deltas = eval.gold_regression_gate(outputs, gold_set, prev_best, spec)
+    # 7. expl_quality = eval.explanation_quality(outputs, spec)
+    # 8. expl_ok, expl_mode = eval.explanation_gate(expl_quality, spec, has_baseline)
+    # 9. keep = eval.keep_or_discard(composite > prev_best, gold_ok, expl_ok)
+    # 10. if keep: git commit, has_baseline = True
+    #     else: git checkout -- train.py
+    # 11. observe.log_experiment(run_ctx, result)
+    # 12. if 3 consecutive no-improvement: nudge toward LoRA
+    # 13. enforce budget/time from spec.limits
 ```
 
 ### 11. `program.md` -- Tiny Instruction Set
@@ -433,20 +550,25 @@ Rules:
 - Base model: see spec.yaml providers.scorer (currently Llama-3.1-8B on Hyperbolic)
 
 Keep/discard has THREE gates (all must pass):
-1. Composite score must improve (includes FP penalty and Kappa-adjusted weights)
-2. Gold-set veto: no axis may degrade vs human consensus labels
-3. Explanation gate: explanation quality must be >= 0.5
+1. Composite score must improve (Kappa-adjusted weights + FP penalty)
+2. Gold-set veto: no axis may degrade vs human consensus labels (all axes, including zero-weighted)
+3. Explanation gate: after first baseline, explanation quality must be >= 0.5
 
-The gold-set veto has absolute authority. An experiment that improves composite
-by +10% will still be rejected if it degrades any single axis. Do not chase
-composite improvements that ignore per-axis quality.
+The gold-set veto has absolute authority and uses raw human labels (not
+Kappa-adjusted). An experiment that improves composite by +10% will still be
+rejected if it degrades any single axis. Do not chase composite improvements
+that ignore per-axis quality.
 
-Trust axes, composite weights, and thresholds are in spec.yaml. Do not change them.
+Your scorer must output structured JSON with both trust_vector and explanation:
+  {"trust_vector": {...}, "explanation": {"reasons": [...], "summary": "..."}}
+The reasons array must reference flagged axes (scores > 0.5). This is tested.
+
+Trust axes, weights, and thresholds are in spec.yaml.
 
 Priorities:
 1. Thread encoder: per-email embeddings -> attention over thread -> chain classifier
-2. Multi-task heads for solved axes (phish, manipulation, classic, authority_impersonation)
-3. Explanation output: structured reasons why email is suspicious (this is gated!)
+2. Multi-task heads for fast axes (phish, manipulation, classic, verify_by_search)
+3. Explanation reasons: must cover all flagged axes (this is gated after baseline!)
 4. When gains stall: LoRA fine-tune via TrainingProvider (auto-terminate GPUs)
 
 Start now.
@@ -457,46 +579,47 @@ Start now.
 Platform code is heavily tested (TDD). `train.py` is lightly smoke-tested.
 
 **Unit tests:**
-- `test_composite_metric.py` -- formula matches spec weights, FP penalty works
-- `test_kappa_downweight.py` -- Kappa-proportional downweighting + redistribution math is correct
-- `test_escalation_rules.py` -- judge fallback triggers at threshold
+- `test_composite_metric.py` -- auto-dispatches binary->F1, continuous->agreement; formula matches spec weights; composite_penalties applied separately
+- `test_kappa_downweight.py` -- proportional downweighting math, redistribution, scope is composite-only (gold veto unaffected), zero-weighted axes handled correctly
+- `test_escalation_rules.py` -- judge fallback triggers for `axis_groups.subtle` at threshold
 - `test_safety_filter.py` -- rejects operational instructions, allows structural malicious
-- `test_schema_validation.py` -- all models round-trip correctly
-- `test_gold_gate.py` -- rejects axis regressions, accepts genuine improvements, veto overrides composite
-- `test_explanation_gate.py` -- blocks below threshold, passes above, respects gate_enabled flag
+- `test_schema_validation.py` -- TrustVector validates keys against spec, ScorerOutput round-trips, Explanation reasons are list[str]
+- `test_gold_gate.py` -- rejects axis regressions on raw labels, no downweighting applied, zero-weighted axes still vetoed, veto overrides composite
+- `test_explanation_gate.py` -- quality = flagged_referenced / flagged_total; no-flags = 1.0; warn mode logs but passes; gate mode blocks below threshold; gate_after_baseline respected
 
 **Contract tests (`test_providers.py`):**
 - Mock/fixture-based per provider interface
 - OllamaGenerator: returns well-formed text, handles batch, check_available works
 - HyperbolicScorer: returns parseable scores, handles retry
 - HyperbolicTrainer: rent/stop lifecycle, budget guard triggers at limit
-- AnthropicJudge: returns per-axis scores, dual_judge returns agreement, bias mitigations applied
+- AnthropicJudge: returns per-axis scores matching trust_axes names, dual_judge returns agreement
 
 **Smoke tests (`test_smoke.py`):**
 - Tiny eval set (10 chains), tiny gold set (10 chains)
-- One full loop cycle with dummy `train.py` returning fixed scores
+- One full loop cycle with dummy `train.py` returning fixed ScorerOutput
 - Verifies three-gate keep/discard works end-to-end
-- Verifies explanation gate blocks when quality is low
+- Verifies explanation gate modes (warn vs gate) behave correctly
+- Verifies structured explanation output is validated
 
 **Regression tests (frozen data):**
-- Gold-set agreement checks against committed gold_chains.jsonl
+- Gold-set agreement checks against committed gold_chains.jsonl (raw labels)
 - False-positive test slice
-- Explanation format validation
+- Explanation format validation (reasons array present, maps to valid axis names)
 
 ## Execution Order
 
 1. **Scaffold**: pyproject.toml, .env.example, .gitignore, spec.yaml
-2. **annotation_rubric.md** (BEFORE any data gen -- defines axis semantics)
+2. **annotation_rubric.md** (BEFORE any data gen -- defines axis semantics for annotation)
 3. **Core platform**: config.py, schemas.py, providers/ (registry + ollama.py, hyperbolic.py, anthropic.py)
 4. **Unit + contract tests** for core platform (TDD)
-5. **data.py + eval.py** (data module + evaluation policy with all three gates)
-6. **Unit tests** for data/eval (composite, downweighting, escalation, safety, gold gate, explanation gate)
+5. **data.py + eval.py** (data module + evaluation policy with auto-dispatch and three gates)
+6. **Unit tests** for data/eval (composite dispatch, downweighting, gold gate on raw labels, explanation gate modes)
 7. **observe.py** (structured logging, run artifacts)
 8. Generate gold-set candidates: `uv run python -m autotrust.data build-gold`
 9. **HUMAN STEP**: annotate 200 chains, run `calibrate-judge`, review Kappa per axis
-10. **train.py** baseline scorer
-11. **program.md** (tiny, explains three-gate policy)
+10. **train.py** baseline scorer (structured ScorerOutput with explanation.reasons)
+11. **program.md** (tiny, explains three-gate policy + structured output contract)
 12. **run_loop.py** (thin orchestration)
-13. **Smoke tests** (10-chain eval, 1 loop cycle, three-gate verification)
+13. **Smoke tests** (10-chain eval, 1 loop cycle, three-gate + explanation mode verification)
 14. Generate eval_set: `uv run python -m autotrust.data build-eval`
 15. Update README.md
