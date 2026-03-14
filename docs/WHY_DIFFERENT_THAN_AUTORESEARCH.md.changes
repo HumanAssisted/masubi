@@ -1,0 +1,126 @@
+# How AutoEmailTrust Extends autoresearch
+
+[Karpathy's autoresearch](https://github.com/karpathy/autoresearch) (2026) is our direct ancestor. We use the same core pattern — an agent edits train.py, runs training, evaluates, keeps or discards — but we extend it from single-metric optimization to **multi-axis model training** with a path toward **Mixture of Experts**.
+
+## What We Share With autoresearch
+
+- **The loop**: agent proposes edit → run training → evaluate → keep/discard via git → repeat.
+- **train.py is the genome**: the agent edits real training code that produces real model weights.
+- **program.md as research spec**: natural language instructions guiding the agent.
+- **Per-experiment time cap**: autoresearch uses 5 min, we use 10 min (configurable in spec.yaml).
+- **Git-backed versioning**: kept experiments are commits; discarded ones are reverted.
+
+## What We Add
+
+### 1. Multi-Axis Training Instead of Single-Metric Optimization
+
+autoresearch optimizes one number (val_bpb). We train models that produce a **10-axis trust vector**:
+
+```
+phish, truthfulness, verify_by_search, manipulation, deceit,
+vulnerability_risk, subtle_toxicity, polarization, classic_email_metrics,
+authority_impersonation
+```
+
+Each axis has its own type (binary/continuous), metric (F1/agreement), and weight. The agent's job is to modify training code — architecture, loss functions, multi-task heads, optimizer settings — to improve **all axes jointly**, not just a single loss.
+
+This is the hard problem. Improving phish detection while degrading manipulation detection is a net loss even if the weighted composite goes up. The three-gate evaluation (composite + gold-set veto + explanation gate) prevents this.
+
+### 2. Per-Axis Expert Training → Mixture of Experts
+
+The 10-axis structure creates a natural path to **MoE**:
+
+**Phase 1 — Joint multi-task training** (current architecture):
+- Single model with multi-task heads, one per axis (or per axis group)
+- Agent modifies architecture, loss weighting, training loop
+- Three-gate eval ensures no axis regresses
+
+**Phase 2 — Per-axis specialist models**:
+- Train a specialist model per axis (or per axis group: binary, continuous, subtle, fast)
+- Each specialist is optimized via its own autoresearch loop with axis-specific metrics
+- Specialists can use different architectures suited to their axis type
+
+**Phase 3 — MoE routing**:
+- Combine axis specialists into a Mixture of Experts
+- Learn a gating/routing network that selects experts per input
+- The composite score becomes the MoE's joint objective
+- Gold-set veto ensures individual expert quality is preserved
+
+This is better than standard RL fine-tuning because:
+- **RL (GRPO/DPO) optimizes one reward signal** — collapsing 10 axes into one reward loses axis-level control
+- **MoE preserves axis independence** — each expert owns its axis, no cross-axis interference
+- **The autoresearch loop trains each expert** — architecture search + hyperparameter optimization per axis, not just reward shaping
+- **Gold-set veto prevents Goodhart's Law** — no axis can degrade to boost the composite
+
+### 3. Why This Can Beat RL
+
+| Dimension | Standard RL (GRPO/DPO) | Our approach (autoresearch + MoE) |
+|---|---|---|
+| **Reward signal** | Single scalar reward | 10 independent axis metrics |
+| **Axis interference** | Axes compete in one reward function | Each expert optimized independently |
+| **Architecture search** | Fixed architecture, optimize weights only | Agent modifies architecture per experiment |
+| **Goodhart risk** | High — model games the reward | Low — gold-set veto on raw labels per axis |
+| **Interpretability** | Opaque weight changes | Each expert is inspectable per axis |
+| **Scalability** | Retrain everything for new axes | Add a new expert + routing entry |
+
+Recent work (GEPA, ICLR 2026) showed that code-level optimization via agents can outperform GRPO by 6% average (up to 20%) while using **35x fewer rollouts**. Our system extends this: instead of optimizing prompts, the agent optimizes actual training code — architecture, loss functions, multi-task heads — with the autoresearch loop providing the evolutionary pressure.
+
+### 4. Three-Gate Evaluation as Multi-Axis Quality Control
+
+autoresearch uses `if new_metric < old_metric: keep`. We need more:
+
+| Gate | What it checks | Why it matters for multi-axis training |
+|------|---------------|---------------------------------------|
+| **Composite improvement** | Weighted score across all axes (Kappa-adjusted) | Ensures overall progress |
+| **Gold-set veto** | No single axis may degrade vs. human labels | Prevents axis interference — the key MoE requirement |
+| **Explanation gate** | Model must explain which axes it flagged and why | Forces the model to learn axis-aware features, not shortcuts |
+
+The gold-set veto is the critical difference. It uses **raw human labels** (not Kappa-adjusted) and has absolute authority. This means each axis is independently protected — exactly the property needed to later split into per-axis experts.
+
+### 5. Human Calibration via Kappa
+
+autoresearch has deterministic eval. Our ground truth comes from human annotators who disagree at different rates per axis. Cohen's Kappa measures agreement and **downweights unreliable axes in the composite** (but NOT in the gold-set veto — that always uses raw labels). This prevents the training loop from over-optimizing on axes where humans can't even agree.
+
+### 6. Structured Observability
+
+autoresearch logs to results.tsv. We need richer monitoring because we're tracking 10 axes:
+
+- `metrics.jsonl` — per-experiment, all axis scores, gate results, cost
+- Gradio dashboard with per-axis trend charts (charts-first UX)
+- Git diff viewer for train.py evolution
+- Per-axis Kappa calibration tracking
+
+## Architecture Roadmap
+
+```
+Phase 1 (now):     Single model, multi-task heads, agent edits train.py
+                   ↓ autoresearch loop per experiment
+                   ↓ three-gate eval protects all axes
+
+Phase 2 (next):    Per-axis (or per-group) specialist training
+                   ↓ separate autoresearch loop per specialist
+                   ↓ axis-specific metrics as the single eval target
+
+Phase 3 (target):  MoE assembly
+                   ↓ gating network routes inputs to specialists
+                   ↓ composite score = MoE objective
+                   ↓ gold-set veto = per-expert quality floor
+```
+
+## What We Still Want From autoresearch
+
+| Feature | autoresearch | Us | Status |
+|---------|-------------|-----|--------|
+| **Per-experiment time cap** | 5 min wall-clock | 10 min (configurable) | Done |
+| **Parallel agents on branches** | 4 Claude + 4 Codex | Single sequential loop | Future — per-axis parallel training |
+| **Simplicity criterion** | Prefers removing code | No equivalent | Should add — train.py bloat is a risk |
+| **Real model training** | PyTorch training in train.py | Currently prompt-only, must become real training | **Must fix** — train.py should contain actual PyTorch training code |
+
+## The Key Insight
+
+autoresearch proved that an agent can do architecture search + hyperparameter optimization via code editing, outperforming manual tuning. We apply this same approach to a **multi-axis classification problem** where:
+
+1. The agent edits real training code (not just prompts)
+2. The eval is multi-dimensional (10 axes, not one metric)
+3. The safety rails prevent axis interference (gold-set veto)
+4. The natural endpoint is MoE — each axis becomes an expert, each expert is trained by its own autoresearch loop
