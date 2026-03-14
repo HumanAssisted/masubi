@@ -3,7 +3,8 @@ WE need to rearchtected the code
 1. read the following requirements carefully, break into task list in single file, using agents to resesarch
 2. reasearch where this changes in the code, add to task list
 3. research where our documentation is out of date and add that to the task list
-4. create the TRD we can later break into tasks.
+4. research where our dashboard will need to change. 
+5. create the TRD we can later break into tasks.
 
 
 # AutoEmailTrust v3.5 — PRD/TRD

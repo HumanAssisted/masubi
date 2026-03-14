@@ -42,6 +42,7 @@ def composite_trend(metrics: list[dict]) -> go.Figure:
     x = list(range(1, len(metrics) + 1))
     y = [m.get("composite", 0.0) for m in metrics]
     colors = ["green" if _is_kept(m) else "red" for m in metrics]
+    descs = [m.get("change_description", "") for m in metrics]
 
     fig = go.Figure()
     # Line trace
@@ -53,10 +54,15 @@ def composite_trend(metrics: list[dict]) -> go.Figure:
             line={"color": "steelblue"},
             marker={"color": colors, "size": 10},
             name="Composite",
+            text=descs,
+            hovertemplate="Exp %{x}: %{y:.4f}<br>%{text}<extra></extra>",
         )
     )
+
+    n_total = len(metrics)
+    n_kept = sum(1 for m in metrics if _is_kept(m))
     fig.update_layout(
-        title="Composite Score Trend",
+        title=f"Composite Score: {n_total} Experiments, {n_kept} Kept",
         xaxis_title="Experiment",
         yaxis_title="Composite Score",
     )
@@ -64,7 +70,8 @@ def composite_trend(metrics: list[dict]) -> go.Figure:
 
 
 def enhanced_composite_trend(metrics: list[dict]) -> go.Figure:
-    """Enhanced composite trend with baseline markers, best-so-far line, and improvement rate.
+    """Enhanced composite trend with baseline markers, best-so-far line, improvement rate,
+    and annotations on kept experiments showing what changed.
 
     Used in the Optimization Dashboard tab for deeper analysis.
     """
@@ -85,17 +92,42 @@ def enhanced_composite_trend(metrics: list[dict]) -> go.Figure:
 
     fig = go.Figure()
 
-    # Main composite line
-    fig.add_trace(
-        go.Scatter(
-            x=x,
-            y=y,
-            mode="lines+markers",
-            line={"color": "steelblue"},
-            marker={"color": colors, "size": 10},
-            name="Composite",
+    # Discarded experiments as faint background dots
+    disc_x = [xi for xi, m in zip(x, metrics) if not _is_kept(m)]
+    disc_y = [yi for yi, m in zip(y, metrics) if not _is_kept(m)]
+    if disc_x:
+        fig.add_trace(
+            go.Scatter(
+                x=disc_x,
+                y=disc_y,
+                mode="markers",
+                marker={"color": "#cccccc", "size": 8, "opacity": 0.5},
+                name="Discarded",
+            )
         )
-    )
+
+    # Kept experiments as prominent green dots
+    kept_x = [xi for xi, m in zip(x, metrics) if _is_kept(m)]
+    kept_y = [yi for yi, m in zip(y, metrics) if _is_kept(m)]
+    kept_descs = [
+        m.get("change_description", "") for m in metrics if _is_kept(m)
+    ]
+    if kept_x:
+        fig.add_trace(
+            go.Scatter(
+                x=kept_x,
+                y=kept_y,
+                mode="markers",
+                marker={
+                    "color": "#2ecc71",
+                    "size": 12,
+                    "line": {"color": "black", "width": 1},
+                },
+                name="Kept",
+                text=kept_descs,
+                hovertemplate="%{text}<br>Composite: %{y:.4f}<extra></extra>",
+            )
+        )
 
     # Best-so-far step line
     fig.add_trace(
@@ -103,10 +135,25 @@ def enhanced_composite_trend(metrics: list[dict]) -> go.Figure:
             x=x,
             y=best_so_far,
             mode="lines",
-            line={"color": "gold", "dash": "dot", "width": 2},
-            name="Best So Far",
+            line={"color": "#27ae60", "width": 2},
+            name="Running Best",
         )
     )
+
+    # Annotate kept experiments with their change description
+    for xi, yi, desc in zip(kept_x, kept_y, kept_descs):
+        if desc:
+            label = desc[:45] + "..." if len(desc) > 45 else desc
+            fig.add_annotation(
+                x=xi,
+                y=yi,
+                text=label,
+                showarrow=False,
+                textangle=-30,
+                xshift=8,
+                yshift=8,
+                font={"size": 9, "color": "#1a7a3a"},
+            )
 
     # Baseline horizontal line (first experiment)
     baseline = y[0]
@@ -130,8 +177,10 @@ def enhanced_composite_trend(metrics: list[dict]) -> go.Figure:
             yshift=20,
         )
 
+    n_total = len(metrics)
+    n_kept = len(kept_x)
     fig.update_layout(
-        title="Composite Score Trend (Enhanced)",
+        title=f"Autoresearch Progress: {n_total} Experiments, {n_kept} Kept Improvements",
         xaxis_title="Experiment",
         yaxis_title="Composite Score",
     )
@@ -514,3 +563,43 @@ def run_comparison(metrics1: list[dict], metrics2: list[dict]) -> go.Figure:
         yaxis_title="Best Score",
     )
     return fig
+
+
+def summary_stats(metrics: list[dict]) -> str:
+    """Generate a markdown summary header for the run."""
+    if not metrics:
+        return ""
+
+    n_total = len(metrics)
+    n_kept = sum(1 for m in metrics if _is_kept(m))
+    n_discarded = n_total - n_kept
+    keep_rate = (n_kept / n_total * 100) if n_total else 0
+
+    composites = [m.get("composite", 0.0) for m in metrics]
+    baseline = composites[0]
+    best = max(composites)
+    latest = composites[-1]
+    improvement = best - baseline
+
+    total_cost = sum(m.get("cost", 0) for m in metrics)
+
+    # Gate failure breakdown
+    gate_fails: dict[str, int] = {}
+    for m in metrics:
+        for gate, passed in m.get("gate_results", {}).items():
+            if not passed:
+                gate_fails[gate] = gate_fails.get(gate, 0) + 1
+
+    fail_parts = [f"{g}: {c}" for g, c in sorted(gate_fails.items())]
+    fail_str = ", ".join(fail_parts) if fail_parts else "none"
+
+    return (
+        f"**{n_total}** experiments | "
+        f"**{n_kept}** kept ({keep_rate:.0f}%) | "
+        f"**{n_discarded}** discarded | "
+        f"Baseline: **{baseline:.4f}** | "
+        f"Best: **{best:.4f}** ({improvement:+.4f}) | "
+        f"Latest: **{latest:.4f}** | "
+        f"Cost: **${total_cost:.2f}** | "
+        f"Gate failures: {fail_str}"
+    )
