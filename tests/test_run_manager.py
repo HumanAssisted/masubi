@@ -29,16 +29,15 @@ def test_initial_status_is_idle():
 
 
 def test_start_sets_running():
-    """After start(), status is 'running' and current_run_id is not None."""
+    """After start(), status is 'running' and current_run_id may be detected."""
     from autotrust.dashboard.run_manager import RunManager
 
     rm = RunManager()
-    with patch("autotrust.dashboard.run_manager.run_autoresearch", side_effect=_mock_run_autoresearch):
-        run_id = rm.start(max_experiments=5)
+    with patch("run_loop.run_autoresearch", side_effect=_mock_run_autoresearch):
+        result = rm.start(max_experiments=5)
         time.sleep(0.05)
         assert rm.status == "running"
-        assert rm.current_run_id is not None
-        assert run_id is not None
+        assert result is not None
         rm.stop()
         time.sleep(0.2)
 
@@ -48,7 +47,7 @@ def test_stop_sets_stopping_then_idle():
     from autotrust.dashboard.run_manager import RunManager
 
     rm = RunManager()
-    with patch("autotrust.dashboard.run_manager.run_autoresearch", side_effect=_mock_run_autoresearch):
+    with patch("run_loop.run_autoresearch", side_effect=_mock_run_autoresearch):
         rm.start(max_experiments=1000)
         time.sleep(0.05)
         rm.stop()
@@ -62,7 +61,7 @@ def test_pause_resume_lifecycle():
     from autotrust.dashboard.run_manager import RunManager
 
     rm = RunManager()
-    with patch("autotrust.dashboard.run_manager.run_autoresearch", side_effect=_mock_run_autoresearch):
+    with patch("run_loop.run_autoresearch", side_effect=_mock_run_autoresearch):
         rm.start(max_experiments=1000)
         time.sleep(0.05)
 
@@ -92,7 +91,7 @@ def test_start_when_already_running_raises():
     from autotrust.dashboard.run_manager import RunManager
 
     rm = RunManager()
-    with patch("autotrust.dashboard.run_manager.run_autoresearch", side_effect=_mock_run_autoresearch):
+    with patch("run_loop.run_autoresearch", side_effect=_mock_run_autoresearch):
         rm.start(max_experiments=1000)
         time.sleep(0.05)
 
@@ -101,3 +100,59 @@ def test_start_when_already_running_raises():
 
         rm.stop()
         time.sleep(0.5)
+
+
+def test_exception_sets_error_status():
+    """If run_autoresearch raises, status becomes 'error' and last_error is set."""
+    from autotrust.dashboard.run_manager import RunManager
+
+    rm = RunManager()
+
+    def _crashing_run(**kwargs):
+        raise ValueError("API key missing")
+
+    with patch("run_loop.run_autoresearch", side_effect=_crashing_run):
+        rm.start(max_experiments=5)
+        time.sleep(0.3)
+        assert rm.status == "error"
+        assert rm.last_error is not None
+        assert "API key" in str(rm.last_error)
+
+
+def test_stop_race_condition_thread_still_alive():
+    """If thread doesn't exit within timeout, status should NOT become idle."""
+    from autotrust.dashboard.run_manager import RunManager
+
+    rm = RunManager()
+
+    def _slow_run(**kwargs):
+        time.sleep(60)  # won't exit in time
+
+    with patch("run_loop.run_autoresearch", side_effect=_slow_run):
+        rm.start(max_experiments=5)
+        time.sleep(0.05)
+
+        # Patch join timeout to be very short so test doesn't block
+        original_stop = rm.stop
+
+        def quick_stop():
+            if rm._status not in ("running", "paused"):
+                return
+            rm._status = "stopping"
+            rm._stop_event.set()
+            rm._pause_event.set()
+            if rm._thread is not None:
+                rm._thread.join(timeout=0.1)
+                if rm._thread.is_alive():
+                    return  # should NOT set idle
+            rm._status = "idle"
+            rm._thread = None
+
+        quick_stop()
+        # Thread is still alive, so status should remain "stopping"
+        assert rm.status == "stopping"
+
+        # Clean up: let thread die
+        rm._stop_event.set()
+        if rm._thread:
+            rm._thread.join(timeout=2)

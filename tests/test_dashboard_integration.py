@@ -57,10 +57,10 @@ def test_start_button_calls_run_manager():
     """Mock RunManager, click start, verify start() is called."""
     from dashboard import create_app, _run_manager, handle_start
 
-    with patch.object(_run_manager, "start", return_value="test_run_id") as mock_start:
+    with patch.object(_run_manager, "start", return_value="starting") as mock_start:
         result = handle_start(50)
         mock_start.assert_called_once_with(50)
-        assert "test_run_id" in result
+        assert "Starting" in result
 
 
 def test_timer_updates_charts(sample_metrics):

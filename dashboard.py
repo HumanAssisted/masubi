@@ -15,6 +15,15 @@ from autotrust.dashboard.run_manager import RunManager
 
 _run_manager = RunManager()
 
+# Read budget limit from spec.yaml at startup (Issue 007)
+try:
+    import yaml
+
+    _spec_data = yaml.safe_load(Path("spec.yaml").read_text())
+    _budget_limit = float(_spec_data.get("limits", {}).get("max_spend_usd", 5.0))
+except Exception:
+    _budget_limit = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -50,8 +59,8 @@ def _compute_best_scores_table(metrics: list[dict]) -> list[list]:
 def handle_start(max_exp):
     """Start button handler."""
     try:
-        run_id = _run_manager.start(int(max_exp))
-        return f"Running: {run_id}"
+        _run_manager.start(int(max_exp))
+        return "Starting..."
     except RuntimeError as exc:
         return f"Error: {exc}"
 
@@ -75,13 +84,16 @@ def handle_pause_resume():
 def poll_update(state):
     """Timer callback for polling live run data."""
     run_id = _run_manager.current_run_id
+    status_text = _run_manager.status
+    if _run_manager.status == "error" and _run_manager.last_error:
+        status_text = f"error: {_run_manager.last_error}"
     if not run_id:
         return (
             state,
-            _run_manager.status,
+            status_text,
             "$0.00",
             charts.composite_trend([]),
-            charts.cost_burn([], budget_limit=5.0),
+            charts.cost_burn([], budget_limit=_budget_limit),
             charts.radar_chart({}),
             charts.gate_timeline([]),
             charts.stall_indicator([]),
@@ -98,10 +110,10 @@ def poll_update(state):
 
     return (
         state,
-        _run_manager.status,
+        status_text,
         f"${total_cost:.2f}",
         charts.composite_trend(metrics),
-        charts.cost_burn(metrics, budget_limit=5.0),
+        charts.cost_burn(metrics, budget_limit=_budget_limit),
         charts.radar_chart(metrics[-1]) if metrics else charts.radar_chart({}),
         charts.gate_timeline(metrics),
         charts.stall_indicator(metrics),
