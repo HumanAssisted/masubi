@@ -13,6 +13,10 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
 from typing import Any
 
 import structlog
