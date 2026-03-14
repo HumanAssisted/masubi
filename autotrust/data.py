@@ -1,4 +1,4 @@
-"""Data generation and calibration module for AutoEmailTrust v3.5.
+"""Data generation and calibration module for Masubi.
 
 CLI subcommands:
     uv run python -m autotrust.data build-train --count 5000
@@ -508,7 +508,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         prog="autotrust.data",
-        description="Data generation and calibration for AutoEmailTrust v3.5",
+        description="Data generation and calibration for Masubi",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 

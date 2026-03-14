@@ -1,132 +1,99 @@
-**AutoEmailTrust v2: Hyperbolic-Powered Version**  
-(fully focused on your exact requirements + Hyperbolic integration)
+# Masubi -- Requirements
 
-We are keeping the **exact autoresearch loop** (agent edits one core file → fixed-budget experiment → evaluate → git keep/discard) but now **scaling it aggressively** with Hyperbolic for both cheap inference **and** on-demand training/fine-tuning. This gives you:
-- 3–10× cheaper inference than Claude/Anthropic for synthetic data + judge loops
-- Instant H100/H200 clusters ($1.49+/hr) for real model training inside the research loop
-- No local GPU limits — the agent can spin up 8×H100 clusters overnight when it decides a full fine-tune is worth testing
+## Core Concept
 
-### 1. Updated Project Structure (still 3 core files + Hyperbolic glue)
-```
-autoemailtrust/
-├── prepare.py          # FIXED: email loader + Hyperbolic synth data generator (never edited)
-├── analyzer.py         # ← ONLY FILE THE AGENT EDITS (prompts, sub-agents, or full LoRA fine-tune code)
-├── program.md          # Focused instructions (updated below)
-├── hyperbolic_utils.py # NEW: helpers for inference + GPU rental
-├── requirements.txt    # + hyperbolic-cli + openai + Hyperbolic-AgentKit
-└── eval_set/           # 1,000 held-out labeled chains (synthetic + public phishing datasets)
-```
+An autonomous research loop (inspired by Karpathy's autoresearch) that iteratively improves an email trust scorer. An AI agent proposes code changes, the system evaluates them against three independent gates, and keeps or discards via git ratcheting.
 
-### 2. Hyperbolic Integration (this is the big upgrade)
+## Key Requirements
 
-**A. Inference API (OpenAI-compatible – use for everything fast/cheap)**
-```python
-# hyperbolic_utils.py
-import openai
-client = openai.OpenAI(
-    api_key="your-hyperbolic-key",
-    base_url="https://api.hyperbolic.xyz/v1"
-)
+### 1. Three-Layer Architecture
 
-# Example: mass synthetic spearphish generation
-def generate_synthetic_batch(n=1000, model="meta-llama/Llama-3.1-405B"):
-    # dolphin-style uncensored prompt for malicious examples
-    ...
-```
+- **Layer 1 (Config):** `spec.yaml` is the single source of truth for axes, weights, providers, limits, thresholds, calibration, and safety rules. `config.py` loads and validates it.
+- **Layer 2 (Fixed Platform):** Providers, data pipeline, evaluation engine, observability. Heavily tested, never touched by the agent.
+- **Layer 3 (Mutable):** `train.py` is the ONLY file the research agent edits. This constraint makes the ratcheting loop safe.
 
-Use this for:
-- Synthetic data gen (uncensored Dolphin/Llama-3.1-405B at ~1/5th Claude price)
-- Fast judge during evaluation (still fall back to Opus only for final validation)
+### 2. Trust Scoring: 10 Axes, Not Binary
 
-**B. GPU Rental for Training (the real power in the loop)**
-Install:
-```bash
-pip install hyperbolic-cli
-# or use their AgentKit for full programmatic control
-git clone https://github.com/HyperbolicLabs/Hyperbolic-AgentKit
-```
+Traditional spam filtering is binary. We score 10 dimensions:
 
-The Claude Agent SDK agent can now **call shell**:
-```bash
-hyperbolic gpu rent --type h100-8x --hours 2 --name experiment-47
-hyperbolic ssh experiment-47 "python train_lora.py --data /tmp/synth_data"
-```
+| Axis | Type | Metric | Weight |
+|------|------|--------|--------|
+| phish | binary | F1 | 0.22 |
+| truthfulness | continuous | agreement | 0.18 |
+| verify_by_search | binary | F1 | 0.00 |
+| manipulation | continuous | agreement | 0.13 |
+| deceit | continuous | recall | 0.10 |
+| vulnerability_risk | continuous | agreement | 0.10 |
+| subtle_toxicity | continuous | agreement | 0.08 |
+| polarization | continuous | agreement | 0.05 |
+| classic_email_metrics | continuous | agreement | 0.04 |
+| authority_impersonation | continuous | agreement | 0.10 |
 
-In `analyzer.py` the agent can decide:
-- “This prompt tweak is small → just run inference eval”
-- “Delta > 5% and subtle-deceit axis weak → rent H100 cluster, run LoRA fine-tune, evaluate, terminate”
+Output: a trust *vector* (per-axis scores) + weighted composite *scalar*.
 
-Budget control: agent is instructed to never exceed $10 per experiment and must call `hyperbolic gpu stop` at end.
+### 3. Three-Gate Keep/Discard Policy
 
-### 3. Synthetic Data Strategy (now massive & uncensored)
-`prepare.py` runs a nightly job via Hyperbolic inference:
-- 50k+ email chains per night (benign + obvious spam + **subtle** spearphish with hidden deceit, zero-sum polarization, vulnerability traps, etc.)
-- Use your 8-axis prompt to generate + self-label
-- Opus (via Anthropic) validates only the top 10% for quality
-- Store as JSONL with per-axis labels + composite trust score
+All three must pass for an experiment to be kept:
 
-This dataset grows automatically — the agent can even edit the synth prompt in a separate branch.
+1. **Composite improved** -- Kappa-adjusted axis weights + FP penalty
+2. **Gold-set veto** -- Raw human labels, no downweighting, ALL axes (including zero-weighted). ANY regression = reject.
+3. **Explanation gate** -- `warn_then_gate` mode; blocks after first baseline if explanation quality < 0.5
 
-### 4. Focused `program.md` (copy-paste this — this is the new instruction set)
-```
-You are optimizing the world's best email trust scorer.
+### 4. Provider Architecture
 
-You may only edit analyzer.py.
-Every experiment must finish in ≤15 minutes wall time OR ≤$8 Hyperbolic spend.
+Four provider roles, each with pluggable backends:
 
-Your goal: maximize composite trust score on the held-out eval_set.
+- **Generator:** Ollama local (`dolphin3:latest`) -- uncensored synthetic data generation
+- **Scorer:** Hyperbolic (`meta-llama/Llama-3.1-8B-Instruct`) -- fast/cheap inference
+- **Judge:** Anthropic (`claude-opus-4-20250514` primary, `claude-sonnet-4-20250514` secondary) -- subtle axis escalation + agent coordination
+- **Trainer:** Hyperbolic GPU (H100) -- LoRA fine-tuning when gains plateau
 
-Composite metric (do NOT change this formula):
-trust_score = 0.25*phish_f1 + 0.20*truthfulness_agreement + 0.15*manipulation_detection + 0.10*deceit_recall + 0.10*vulnerability_risk + 0.10*subtle_toxicity + 0.05*polarization + 0.05*classic_email_metrics
+### 5. Data Pipeline
 
-Prioritize experiments in this order:
-1. Better chain-of-thought for subtle manipulation & hidden intent
-2. Vulnerability detection given the "ask" (even if content is truthful)
-3. Zero-sum polarization & emotional blackmail patterns
-4. When prompt improvements stall for 3 runs → propose a LoRA fine-tune on Hyperbolic using the latest synthetic data
-5. Always use Hyperbolic inference for speed; only use Claude Opus for judge on final candidates
+- **Eval set:** 1,000 chains (`eval_set/eval_chains.jsonl`)
+- **Gold set:** 200 chains for human annotation (`gold_set/gold_candidates.jsonl`)
+- **Training data:** 5,000+ synthetic chains (`synth_data/train.jsonl`)
+- Safety filtering: placeholder-only brands in synth data, operational instruction blocking
+- Deduplication by content hash
 
-If you rent GPUs, you MUST terminate them before finishing the experiment.
-Log every change, metric delta, and cost.
+### 6. Kappa-Proportional Downweighting
 
-Start now.
-```
+- Axes with low inter-annotator agreement get downweighted in composite (not in veto)
+- `effective_weight = original_weight * min(kappa / min_gold_kappa, 1.0)`
+- Lost weight redistributed proportionally among non-downweighted axes
 
-### 5. Two-Stage Research Loop (much more powerful than v1)
-Stage 1 (default): prompt engineering + sub-agent improvements (fast, cheap inference)  
-Stage 2 (when gains slow): agent writes LoRA fine-tune code → rents H100 cluster → trains on latest 20k+ synthetic examples → merges weights back → evaluates
+### 7. Structured Explanations
 
-This hybrid is exactly what Karpathy envisioned for real research.
+- Scorer outputs `{"trust_vector": {...}, "explanation": {"reasons": [...], "summary": "..."}}`
+- Explanation quality = flagged axes referenced in reasons / total flagged axes
+- This is gated, not cosmetic -- the agent can't compensate for bad explanations with better scores
 
-### 6. Model Recommendations for the Scorer
-- Start: Llama-3.1-8B or Qwen2.5-14B (fits in single H100)
-- Scale: distill to 3B–7B after 200 experiments for production speed
-- All fine-tuning done with Unsloth or Axolotl on Hyperbolic (pre-installed images available)
+### 8. Budget and Time Constraints
 
-### 7. Quick Start Commands (do these today)
-```bash
-# 1. Fork & setup
-git clone https://github.com/yourname/autoemailtrust
-uv sync
+- 15 minutes wall time per experiment
+- $8 maximum spend per experiment
+- Agent nudged toward LoRA fine-tuning after 3 consecutive no-improvement experiments
 
-# 2. Hyperbolic setup
-hyperbolic login   # or export HYPERBOLIC_API_KEY=...
+### 9. Observability
 
-# 3. First run
-python -m claude_agent_sdk run --program program.md --model claude-3.5-sonnet
-```
+- Structured logging via structlog
+- Per-run artifacts in `runs/<run_id>/` (metrics, predictions, config, summary)
+- Gradio dashboard for real-time monitoring (composite trend, per-axis radar, gate timeline, code diff)
 
-This setup will produce **dramatically better results** than pure prompting because the agent can now actually **train** real models on cheap Hyperbolic compute when it discovers something worth memorizing.
+### 10. Safety
 
-We now have:
-- Unlimited synthetic malicious data
-- Real fine-tuning inside the loop
-- Cost controls + automatic termination
-- All while keeping the original autoresearch simplicity
+- Synthetic data: placeholder brands only (no real PayPal, Google, etc.)
+- Eval data: real brands allowed
+- Operational instruction patterns blocked (reverse shell, malware, etc.)
+- Agent sandboxed to train.py -- cannot modify evaluation contract
 
-Ready for the next step? Tell me:
-- Draft the full `analyzer.py` skeleton + `hyperbolic_utils.py`?
-- Or the first 10 synthetic email examples generated with Hyperbolic?
-- Or the exact Claude Agent SDK + Hyperbolic-AgentKit orchestration code?
+### 11. Orchestration
 
-We’re building the best spearphishing detector on the planet. Let’s ship the first 50 experiments tonight.
+- `run_loop.py` drives the loop: agent prompt -> edit train.py -> score -> three-gate eval -> git keep/discard
+- Uses direct Anthropic tool-use (not Agent SDK) for full control over budget enforcement and git integration
+- Dashboard callbacks for stop/pause control
+
+### 12. Setup
+
+- `setup.sh` handles: Python deps (uv), .env creation, Ollama model pull, data generation
+- Idempotent -- skips steps already completed

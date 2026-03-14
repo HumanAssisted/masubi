@@ -1,4 +1,4 @@
-"""Structured logging and run artifact management for AutoEmailTrust v3.5.
+"""Structured logging and run artifact management for Masubi.
 
 Uses structlog for JSON output. Manages per-run directories under runs/<run_id>/.
 """

@@ -1,4 +1,4 @@
-# Annotation Rubric -- AutoEmailTrust v3.5
+# Annotation Rubric -- Masubi
 
 ## 1. Overview
 

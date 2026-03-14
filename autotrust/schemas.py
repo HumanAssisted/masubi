@@ -1,4 +1,4 @@
-"""Pydantic data models for AutoEmailTrust v3.5.
+"""Pydantic data models for Masubi.
 
 TrustVector is dict[str, float] validated against spec.yaml axis names,
 NOT a dynamically generated pydantic model.

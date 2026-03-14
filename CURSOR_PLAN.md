@@ -1,6 +1,6 @@
 ---
-name: AutoEmailTrust v3.5 Lean
-overview: "AutoEmailTrust v3.5: lean autoresearch loop with 3 layers. spec.yaml as single source of truth with structured axis definitions (name/type/metric/weight), axis_groups for eval dispatch, composite_penalties separated from axis weights. TrustVector as dict[str, float] validated against spec. Explanation gate with warn_then_gate mode. Kappa downweighting for composite only; gold-set veto always uses raw human labels. Structured explanation output (not CoT extraction)."
+name: Masubi
+overview: "Masubi: lean autoresearch loop with 3 layers. spec.yaml as single source of truth with structured axis definitions (name/type/metric/weight), axis_groups for eval dispatch, composite_penalties separated from axis weights. TrustVector as dict[str, float] validated against spec. Explanation gate with warn_then_gate mode. Kappa downweighting for composite only; gold-set veto always uses raw human labels. Structured explanation output (not CoT extraction)."
 todos:
   - id: scaffold
     content: "Create pyproject.toml (uv, Python 3.12), .env.example, .gitignore, spec.yaml with structured trust_axes, axis_groups, composite_penalties, providers, limits, judge, calibration, explanation, safety, data"
@@ -44,7 +44,7 @@ todos:
 isProject: false
 ---
 
-# AutoEmailTrust v3.5 Lean
+# Masubi
 
 Updates from v3.4: (1) Fixed axis/weight naming mismatch -- trust_axes are now structured objects with name/type/metric/weight, composite_penalties is a separate section, (2) axis_groups encode binary/continuous/subtle/fast groupings in spec, (3) TrustVector is `dict[str, float]` validated against spec (not dynamic pydantic), (4) explanation gate supports `warn_then_gate` mode, (5) Kappa downweighting explicitly scoped to composite only -- gold-set veto always uses raw human labels, (6) explanation quality concretely defined as flagged-axis coverage, (7) train.py emits structured explanation (reasons array) not CoT extraction.
 

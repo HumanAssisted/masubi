@@ -1,4 +1,4 @@
-# AutoEmailTrust v3.5 -- Design Choices & Rationale
+# Masubi -- Design Choices & Rationale
 
 ## Why Autoresearch as the Foundation
 
@@ -14,11 +14,11 @@
 - **Layer 3 -- train.py as the only mutable file:** the autoresearch agent edits nothing else. This constraint is what makes the ratcheting loop safe -- the evaluation contract can never be gamed
 - Why three layers: autoresearch's power comes from a tight sandbox. The agent is creative within constraints; the constraints themselves are immovable
 
-## Trust Score: 9 Dimensions, Not Binary
+## Trust Score: 10 Dimensions, Not Binary
 
 - Traditional spam/phishing detection is binary (spam or not spam) -- and it's essentially solved at >98% accuracy
 - The hard problem is everything else: is a legitimate-looking email subtly manipulative? Does it exploit authority? Is the recipient being put at risk even if the sender is trustworthy?
-- Nine axes: phish (binary), truthfulness, verify-by-search (binary), manipulation, deceit, vulnerability risk, subtle toxicity, polarization, authority impersonation
+- Ten axes: phish (binary), truthfulness, verify-by-search (binary), manipulation, deceit, vulnerability risk, subtle toxicity, polarization, classic email metrics, authority impersonation
 - Each axis carries its own metric type (F1 for binary, agreement/recall for continuous) and composite weight -- defined in spec.yaml, not code
 - The output is a trust *vector* (dict of per-axis scores) plus a weighted composite *scalar* -- the vector gives per-dimension insight, the scalar drives the autoresearch keep/discard loop
 
@@ -165,50 +165,17 @@ Result: a system that can run unsupervised for days yet still produces trustwort
 
 ---
 
-## Review Summary
+## Implementation Status (as of 2026-03-14)
 
-**Review Date:** 2026-03-14
-**Reviewer:** Claude Code (deep-review)
-**Tests:** 103/103 passing (5.63s)
-**Lint:** ruff check clean (0 violations)
+All critical components are now implemented and functional:
 
-### Issue Counts by Severity
-| Severity | Count |
-|----------|-------|
-| Critical | 2 |
-| High     | 4 |
-| Medium   | 5 |
-| Low      | 4 |
-| **Total**| **15** |
-
-### Issues by Category
-| Category | Count |
-|----------|-------|
-| Omission | 4 |
-| Bug | 4 |
-| DRY Violation | 2 |
-| Quality | 2 |
-| Test Gap | 1 |
-
-### Requirements Met
-- Scaffold (pyproject.toml, .env.example, .gitignore, directories) -- MET
-- spec.yaml (10 axes, weights sum to 1.0, all sections) -- MET
-- annotation_rubric.md (all 10 axes, edge cases, annotator instructions) -- MET
-- config.py (pydantic models, load_spec, get_spec singleton) -- MET (formula issue in get_effective_weights)
-- schemas.py (all models, validate_trust_vector) -- MET (validation not at construction time)
-- providers/ (registry, 4 roles, retry, concrete implementations) -- MET (retry scope limited)
-- data.py (CLI, safety filter, Kappa computation) -- PARTIALLY MET (pipeline is placeholder)
-- eval.py (three-gate policy, auto-dispatch, explanation gate) -- MET (FP penalty issue)
-- observe.py (run lifecycle, artifacts) -- PARTIALLY MET (no structlog, metrics overwritten)
-- train.py (EmailTrustScorer, structured output, thread signals) -- MET
-- program.md (agent instructions, three-gate policy) -- MET
-- run_loop.py (orchestration) -- NOT MET (placeholder loop)
-- Smoke tests (9 tests, three-gate coverage) -- MET (one conditional assertion)
-- README.md -- MET (one bad file reference)
-
-### Critical Items
-1. **ISSUE 001**: run_loop.py main loop is unimplemented -- the autoresearch loop cannot execute
-2. **ISSUE 002**: All data pipeline subcommands are placeholders -- no data can be generated
-
-### Recommendation
-**Needs rework.** The two critical issues (unimplemented orchestration loop and placeholder data pipeline) mean the system cannot run any experiments. The fixed platform layer (eval.py, config.py, schemas.py, providers/) is solid and well-tested, but the glue that ties it all together (run_loop.py, data.py) is incomplete. The Kappa formula bug (Issue 003) and missing structlog (Issue 004) are significant deviations from the PRD that should be fixed before shipping.
+- **run_loop.py**: Full orchestration loop with agent calls, three-gate evaluation, git keep/discard, budget/time enforcement, and dashboard stop/pause callbacks
+- **data.py**: Complete data generation pipeline (build-eval, build-gold, build-train, annotate-export, calibrate-judge) with safety filtering and deduplication
+- **eval.py**: Three-gate policy with auto-dispatch metrics, Kappa-adjusted composite, gold-set veto, and explanation gate
+- **config.py**: Spec loader with Kappa-proportional downweighting and weight redistribution
+- **schemas.py**: All models including ScorerOutput with construction-time trust vector validation
+- **observe.py**: Structured logging with structlog + run artifact lifecycle
+- **providers/**: Registry with Ollama, Hyperbolic, and Anthropic backends
+- **train.py**: Baseline scorer with thread-aware signals, structured JSON output, and LoRA scaffolding
+- **dashboard.py**: Gradio dashboard for real-time monitoring (composite trend, per-axis radar, gate timeline, code diff viewer)
+- **setup.sh**: One-shot setup script (deps, .env, Ollama model, data generation)
