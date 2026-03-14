@@ -2,6 +2,48 @@
 
 Masubi is an autonomous research system designed to iteratively improve an artificial intelligence model that identifies sophisticated email threats. Inspired by the autoresearch framework, the project utilizes a three-layer architecture where an AI agent is permitted to modify only a single file, ensuring a controlled and safe experimental environment. The system evaluates email chains across ten distinct trust dimensions, such as manipulation and authority impersonation, rather than relying on simple binary labels. Every proposed improvement must pass a rigorous three-gate policy, which requires a higher composite score, a veto check against human-verified data, and high-quality structured explanations. By combining local models for synthetic data generation with advanced cloud-based judges, Masubi maintains a balance between cost-effective testing and expert-level oversight. This design prevents the agent from gaming the metrics while ensuring that findings remain grounded in human consensus.
 
+## How It Works
+
+```
+                    +-------------------+
+                    |   Agent (Sonnet)  |
+                    |  proposes edit to |
+                    |     train.py      |
+                    +---------+---------+
+                              |
+                              v
+                    +-------------------+
+                    |   Score 1,000     |
+                    |   email chains    |
+                    |   (10 trust axes) |
+                    +---------+---------+
+                              |
+                              v
+              +---------------+---------------+
+              |           Three Gates         |
+              |                               |
+              |  1. Composite score improved? |
+              |  2. No axis regressed on      |
+              |     human-verified gold set?  |
+              |  3. Explanations cover all    |
+              |     flagged axes?             |
+              +-------+-----------+-----------+
+                      |           |
+                 ALL PASS      ANY FAIL
+                      |           |
+                      v           v
+               git commit    git revert
+               (keep edit)   (discard)
+                      |           |
+                      +-----+-----+
+                            |
+                            v
+                   Repeat until budget
+                   or time limit hit
+```
+
+The agent can only edit one file (`train.py`). Everything else -- the evaluation policy, data pipeline, and scoring spec -- is frozen. This makes the loop safe to run unattended: the agent can be creative, but it can't game the metrics or weaken the gates.
+
 ## Architecture
 
 Masubi runs a 4-stage pipeline:

@@ -137,12 +137,22 @@ def _should_auto_transition(stage: str, consecutive_no_improvement: int) -> bool
 def _auto_transition(spec: Any) -> str:
     """Execute auto-transition from Stage 1 to Stage 2.
 
-    Calls freeze_teacher() to extract teacher artifacts, then returns 'train'.
+    1. Freeze teacher artifacts
+    2. Archive Stage 1 train.py
+    3. Write Stage 2 train.py template
     """
     from autotrust.freeze import freeze_teacher
     logger.info("Auto-transitioning to Stage 2: freezing teacher artifacts...")
     freeze_teacher(spec)
-    logger.info("Teacher artifacts frozen. Switching to Stage 2.")
+    logger.info("Teacher artifacts frozen.")
+
+    logger.info("Archiving Stage 1 train.py...")
+    _archive_train_py()
+
+    logger.info("Writing Stage 2 train.py template...")
+    _write_stage2_train_py_template()
+
+    logger.info("Stage 2 transition complete.")
     return "train"
 
 
@@ -177,8 +187,19 @@ def _build_agent_prompt(
     train_py: str,
     last_results: list[dict],
     consecutive_no_improvement: int,
+    stage: str = "prompt",
+    spec: Any = None,
 ) -> str:
-    """Build the prompt for the research agent."""
+    """Build the prompt for the research agent.
+
+    Args:
+        program_md: contents of program.md
+        train_py: current train.py source
+        last_results: recent experiment results
+        consecutive_no_improvement: count of consecutive no-improvement experiments
+        stage: "prompt" (Stage 1) or "train" (Stage 2)
+        spec: loaded Spec (used for Stage 2 constraints)
+    """
     prompt = f"""## Instructions
 {program_md}
 
@@ -190,7 +211,26 @@ def _build_agent_prompt(
 ## Last Experiment Results
 {json.dumps(last_results[-3:], indent=2, default=str) if last_results else 'No previous results.'}
 """
-    if consecutive_no_improvement >= 3:
+    if stage == "train" and spec is not None:
+        # Stage 2: include model architecture constraints
+        prompt += "\n## Stage 2: Student Model Training Context\n"
+        prompt += "You are editing train.py for Stage 2 model training.\n"
+        prompt += "train.py is run as a subprocess and must produce a PyTorch checkpoint.\n\n"
+        if spec.stage2:
+            prompt += f"### Architecture Constraints (from spec.yaml)\n"
+            prompt += f"- max_experts: {spec.stage2.max_experts}\n"
+            prompt += f"- max_params_m: {spec.stage2.max_params_m}\n"
+            prompt += f"- max_top_k: {spec.stage2.max_top_k}\n"
+            prompt += f"- dense_baseline_first: {spec.stage2.dense_baseline_first}\n"
+            prompt += f"- export_formats: {spec.stage2.export_formats}\n\n"
+        prompt += "### Available APIs\n"
+        prompt += "- `from autotrust.student import DenseStudent, MoEStudent`\n"
+        prompt += "- `from autotrust.export import export_pytorch`\n"
+        prompt += "- `from autotrust.schemas import StudentConfig, MoEConfig, CheckpointMeta`\n\n"
+        prompt += "### Output Requirements\n"
+        prompt += "train.py must save a checkpoint to `runs/<run_id>/checkpoints/best.pt`\n"
+        prompt += "The checkpoint must produce: {trust_vector, reason_tags, escalate}\n"
+    elif consecutive_no_improvement >= 3:
         prompt += """
 ## IMPORTANT: LoRA Fine-Tuning Nudge
 You have had 3+ consecutive experiments with no improvement.
@@ -199,6 +239,241 @@ Call self.fine_tune(data_path, trainer) to start a fine-tuning run.
 Remember to auto-terminate GPUs when done.
 """
     return prompt
+
+
+def _score_with_student_model(
+    checkpoint_path: Path,
+    texts: list[str],
+    axis_names: list[str],
+) -> list[Any] | None:
+    """Score texts using a student model checkpoint.
+
+    Args:
+        checkpoint_path: path to the .pt checkpoint
+        texts: list of email chain texts to score
+        axis_names: trust axis names from spec
+
+    Returns:
+        List of ScorerOutput, or None if loading fails.
+    """
+    try:
+        from autotrust.inference import LocalInference
+        inference = LocalInference(checkpoint_path)
+        reason_tags = [f"{a}_flagged" for a in axis_names]
+        outputs = []
+        for text in texts:
+            output = inference.score_text(text, axis_names, reason_tags)
+            outputs.append(output)
+        return outputs
+    except Exception as exc:
+        logger.error("Student model scoring failed: %s", exc)
+        return None
+
+
+def _archive_train_py() -> None:
+    """Archive Stage 1 train.py to a backup file and git tag."""
+    import shutil
+    train_path = Path("train.py")
+    if train_path.exists():
+        shutil.copy(str(train_path), "train_stage1_archive.py")
+        logger.info("Archived train.py to train_stage1_archive.py")
+    # Try to create git tag
+    subprocess.run(
+        ["git", "tag", "stage1-complete"],
+        capture_output=True, text=True,
+    )
+
+
+def _write_stage2_train_py_template() -> None:
+    """Write Stage 2 PyTorch training template for train.py."""
+    template = '''"""Stage 2: Student model training script.
+
+This train.py is automatically generated at the Stage 1 -> Stage 2 transition.
+The agent (Sonnet) will modify this file to optimize the student model.
+
+Usage: uv run python train.py
+Output: saves checkpoint to runs/<run_id>/checkpoints/best.pt
+"""
+
+import json
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from autotrust.student import DenseStudent, compute_trust_loss, compute_reason_loss, compute_escalate_loss, compute_total_loss
+from autotrust.export import export_pytorch
+from autotrust.schemas import StudentConfig, CheckpointMeta
+
+
+def load_training_data(synth_dir: Path = Path("synth_data")):
+    """Load soft-labeled training data from synth_data/."""
+    data_path = synth_dir / "train_labeled.jsonl"
+    if not data_path.exists():
+        data_path = synth_dir / "train.jsonl"
+    if not data_path.exists():
+        print("No training data found in synth_data/")
+        sys.exit(1)
+    records = []
+    for line in data_path.read_text().strip().split("\\n"):
+        if line:
+            records.append(json.loads(line))
+    return records
+
+
+def train():
+    """Train the student model."""
+    config = StudentConfig(
+        hidden_size=256,
+        num_layers=6,
+        vocab_size=50000,
+        max_seq_len=512,
+        num_axes=10,
+        num_reason_tags=20,
+    )
+    model = DenseStudent.from_config(config)
+
+    # TODO: Agent will customize this training loop
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    # Save initial checkpoint
+    checkpoint_dir = Path("runs/latest/checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    meta = CheckpointMeta(
+        stage="dense_baseline",
+        experiment_num=0,
+        composite=0.0,
+        path=checkpoint_dir / "best.pt",
+        param_count=model.param_count(),
+    )
+    export_pytorch(model, config, meta, checkpoint_dir / "best.pt")
+    print(f"Checkpoint saved to {checkpoint_dir / 'best.pt'}")
+
+
+if __name__ == "__main__":
+    train()
+'''
+    Path("train.py").write_text(template)
+    logger.info("Wrote Stage 2 train.py template")
+
+
+def _run_stage2_iteration(
+    experiment_num: int,
+    spec: Any,
+    program_md: str,
+    all_results: list[dict],
+    consecutive_no_improvement: int,
+    experiment_start: float,
+) -> dict | None:
+    """Run a single Stage 2 experiment iteration.
+
+    1. Call agent to propose train.py edits
+    2. Run train.py as subprocess
+    3. Load resulting checkpoint
+    4. Score eval chains using student model
+    5. Return scoring results dict or None on failure
+
+    Args:
+        experiment_num: current experiment number
+        spec: loaded Spec
+        program_md: program.md contents
+        all_results: previous experiment results
+        consecutive_no_improvement: no-improvement counter
+        experiment_start: time when experiment started
+
+    Returns:
+        Dict with 'outputs', 'predictions', 'cost' keys, or None on failure.
+    """
+    train_py = Path("train.py").read_text()
+
+    # Build stage-aware agent prompt
+    prompt = _build_agent_prompt(
+        program_md, train_py, all_results, consecutive_no_improvement,
+        stage="train", spec=spec,
+    )
+
+    # Call agent for train.py edits
+    try:
+        proposed_edit = _call_agent(prompt, spec)
+        experiment_cost = 0.01
+        _check_experiment_timeout(experiment_start, spec)
+    except ExperimentTimeout as exc:
+        logger.warning("Stage 2 experiment %d timed out during agent call: %s", experiment_num, exc)
+        return None
+    except Exception as exc:
+        logger.error("Agent call failed in Stage 2: %s", exc)
+        return None
+
+    # Apply edit
+    if proposed_edit and proposed_edit.strip() != train_py.strip():
+        Path("train.py").write_text(proposed_edit)
+    else:
+        logger.info("Agent proposed no change in Stage 2.")
+        return None
+
+    # Run train.py as subprocess
+    logger.info("Running train.py as subprocess (Stage 2)...")
+    timeout_seconds = int(spec.limits.per_experiment_timeout_minutes * 60)
+    try:
+        result = subprocess.run(
+            ["uv", "run", "python", "train.py"],
+            capture_output=True, text=True,
+            timeout=timeout_seconds,
+        )
+        if result.returncode != 0:
+            logger.error("Stage 2 train.py failed: %s", result.stderr[:500])
+            Path("train.py").write_text(train_py)  # restore
+            return None
+    except subprocess.TimeoutExpired:
+        logger.warning("Stage 2 train.py timed out after %ds", timeout_seconds)
+        Path("train.py").write_text(train_py)
+        return None
+    except Exception as exc:
+        logger.error("Stage 2 subprocess error: %s", exc)
+        Path("train.py").write_text(train_py)
+        return None
+
+    # Find checkpoint
+    checkpoint_path = _find_latest_checkpoint()
+    if checkpoint_path is None:
+        logger.warning("No checkpoint found after Stage 2 train.py run")
+        Path("train.py").write_text(train_py)
+        return None
+
+    # Score eval chains using student model
+    eval_chains = load_eval_chains()
+    if not eval_chains:
+        return None
+
+    axis_names = [a.name for a in spec.trust_axes]
+    texts = [
+        "\n".join(f"{e.subject}\n{e.body}" for e in chain.emails)
+        for chain in eval_chains
+    ]
+    outputs = _score_with_student_model(checkpoint_path, texts, axis_names)
+    if outputs is None:
+        Path("train.py").write_text(train_py)
+        return None
+
+    return {
+        "outputs": outputs,
+        "cost": experiment_cost + 0.02 * len(eval_chains),
+        "change_desc": f"Stage 2 model training (experiment {experiment_num})",
+        "original_train_py": train_py,
+    }
+
+
+def _find_latest_checkpoint() -> Path | None:
+    """Find the most recently modified .pt checkpoint in runs/."""
+    runs_dir = Path("runs")
+    if not runs_dir.exists():
+        return None
+    checkpoints = list(runs_dir.glob("**/checkpoints/*.pt"))
+    if not checkpoints:
+        return None
+    return max(checkpoints, key=lambda p: p.stat().st_mtime)
 
 
 def _call_agent(prompt: str, spec: Any) -> str | None:
@@ -379,66 +654,86 @@ def run_autoresearch(
         program_md = Path("program.md").read_text()
         train_py = Path("train.py").read_text()
 
-        # Build agent prompt
-        prompt = _build_agent_prompt(
-            program_md, train_py, all_results, consecutive_no_improvement
-        )
-
-        # --- Call Anthropic Sonnet to propose train.py edits ---
-        experiment_cost = 0.0
-        logger.info("Calling agent (Sonnet) to propose train.py edits...")
-        try:
-            proposed_edit = _call_agent(prompt, spec)
-            agent_duration = time.time() - experiment_start
-            experiment_cost += 0.01  # estimated per-call cost
-            logger.info("Agent responded", duration_sec=f"{agent_duration:.1f}s")
-            _check_experiment_timeout(experiment_start, spec)
-        except ExperimentTimeout as exc:
-            logger.warning("Experiment %d timed out during agent call: %s", experiment_num, exc)
-            consecutive_no_improvement += 1
-            continue
-        except Exception as exc:
-            logger.error("Agent call failed: %s", exc)
-            consecutive_no_improvement += 1
-            continue
-
-        # Apply proposed edit to train.py
-        if proposed_edit and proposed_edit.strip() != train_py.strip():
-            Path("train.py").write_text(proposed_edit)
-            diff_lines = len(proposed_edit.splitlines()) - len(train_py.splitlines())
-            change_desc = f"Agent edit (experiment {experiment_num})"
-            logger.info("Edit applied", lines_delta=f"{diff_lines:+d}", new_lines=len(proposed_edit.splitlines()))
+        if stage == "train":
+            # --- Stage 2: Subprocess execution + checkpoint evaluation ---
+            logger.info("Running Stage 2 iteration...")
+            stage2_result = _run_stage2_iteration(
+                experiment_num=experiment_num,
+                spec=spec,
+                program_md=program_md,
+                all_results=all_results,
+                consecutive_no_improvement=consecutive_no_improvement,
+                experiment_start=experiment_start,
+            )
+            if stage2_result is None:
+                consecutive_no_improvement += 1
+                continue
+            outputs = stage2_result["outputs"]
+            experiment_cost = stage2_result["cost"]
+            change_desc = stage2_result["change_desc"]
         else:
-            change_desc = f"No change proposed (experiment {experiment_num})"
-            logger.info("Agent proposed no change. Skipping scoring.")
-            consecutive_no_improvement += 1
-            continue
+            # --- Stage 1: Prompt optimization (original code path) ---
+            # Build agent prompt
+            prompt = _build_agent_prompt(
+                program_md, train_py, all_results, consecutive_no_improvement,
+                stage="prompt", spec=spec,
+            )
 
-        # --- Score eval chains using modified train.py ---
-        logger.info("Scoring %d eval chains...", len(eval_chains))
-        score_start = time.time()
-        try:
-            from train import EmailTrustScorer
-            from autotrust.providers import get_provider
+            # --- Call Anthropic Sonnet to propose train.py edits ---
+            experiment_cost = 0.0
+            logger.info("Calling agent (Sonnet) to propose train.py edits...")
+            try:
+                proposed_edit = _call_agent(prompt, spec)
+                agent_duration = time.time() - experiment_start
+                experiment_cost += 0.01  # estimated per-call cost
+                logger.info("Agent responded", duration_sec=f"{agent_duration:.1f}s")
+                _check_experiment_timeout(experiment_start, spec)
+            except ExperimentTimeout as exc:
+                logger.warning("Experiment %d timed out during agent call: %s", experiment_num, exc)
+                consecutive_no_improvement += 1
+                continue
+            except Exception as exc:
+                logger.error("Agent call failed: %s", exc)
+                consecutive_no_improvement += 1
+                continue
 
-            scorer_provider = get_provider("scorer", spec)
-            scorer = EmailTrustScorer(provider=scorer_provider, spec=spec)
-            outputs = scorer.score_batch(eval_chains)
-            score_duration = time.time() - score_start
-            experiment_cost += 0.02 * len(eval_chains)  # estimated scoring cost
-            logger.info("Scoring complete", chains=len(outputs), duration_sec=f"{score_duration:.1f}s")
-            _check_experiment_timeout(experiment_start, spec)
-        except ExperimentTimeout as exc:
-            logger.warning("Experiment %d timed out during scoring: %s", experiment_num, exc)
-            Path("train.py").write_text(train_py)
-            consecutive_no_improvement += 1
-            continue
-        except Exception as exc:
-            logger.error("Scoring failed: %s", exc)
-            # Restore train.py on failure
-            Path("train.py").write_text(train_py)
-            consecutive_no_improvement += 1
-            continue
+            # Apply proposed edit to train.py
+            if proposed_edit and proposed_edit.strip() != train_py.strip():
+                Path("train.py").write_text(proposed_edit)
+                diff_lines = len(proposed_edit.splitlines()) - len(train_py.splitlines())
+                change_desc = f"Agent edit (experiment {experiment_num})"
+                logger.info("Edit applied", lines_delta=f"{diff_lines:+d}", new_lines=len(proposed_edit.splitlines()))
+            else:
+                change_desc = f"No change proposed (experiment {experiment_num})"
+                logger.info("Agent proposed no change. Skipping scoring.")
+                consecutive_no_improvement += 1
+                continue
+
+            # --- Score eval chains using modified train.py ---
+            logger.info("Scoring %d eval chains...", len(eval_chains))
+            score_start = time.time()
+            try:
+                from train import EmailTrustScorer
+                from autotrust.providers import get_provider
+
+                scorer_provider = get_provider("scorer", spec)
+                scorer = EmailTrustScorer(provider=scorer_provider, spec=spec)
+                outputs = scorer.score_batch(eval_chains)
+                score_duration = time.time() - score_start
+                experiment_cost += 0.02 * len(eval_chains)  # estimated scoring cost
+                logger.info("Scoring complete", chains=len(outputs), duration_sec=f"{score_duration:.1f}s")
+                _check_experiment_timeout(experiment_start, spec)
+            except ExperimentTimeout as exc:
+                logger.warning("Experiment %d timed out during scoring: %s", experiment_num, exc)
+                Path("train.py").write_text(train_py)
+                consecutive_no_improvement += 1
+                continue
+            except Exception as exc:
+                logger.error("Scoring failed: %s", exc)
+                # Restore train.py on failure
+                Path("train.py").write_text(train_py)
+                consecutive_no_improvement += 1
+                continue
 
         # --- Three-gate evaluation ---
         logger.info("Running three-gate evaluation...")
