@@ -44,18 +44,27 @@ def get_train_py_log(file: str = "train.py") -> list[dict]:
     if not result.stdout.strip():
         return []
 
+    # Pattern to extract composite score from commit message, e.g. "composite=0.724"
+    composite_re = re.compile(r"composite[=:]?\s*([\d.]+)")
+
     commits = []
     for line in result.stdout.strip().split("\n"):
         parts = line.split("|||")
         if len(parts) != 3:
             continue
         commit_hash, message, date = parts
+        msg = message.strip()
+
+        # Try to extract composite from commit message
+        composite_match = composite_re.search(msg)
+        composite = float(composite_match.group(1)) if composite_match else None
+
         commits.append(
             {
                 "hash": commit_hash.strip(),
-                "message": message.strip(),
+                "message": msg,
                 "date": date.strip(),
-                "composite": None,
+                "composite": composite,
             }
         )
     return commits

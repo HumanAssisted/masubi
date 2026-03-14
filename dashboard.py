@@ -129,19 +129,65 @@ def poll_update(state):
 def refresh_git_log():
     """Load git log for train.py."""
     commits = git_history.get_train_py_log()
-    log_data = [[c["hash"][:7], c["message"], c["date"], c.get("composite", "")] for c in commits]
+    log_data = [
+        [
+            c["hash"][:7],
+            c["message"],
+            c["date"],
+            f"{c['composite']:.3f}" if c.get("composite") is not None else "",
+        ]
+        for c in commits
+    ]
     choices = [f"{c['hash'][:7]} - {c['message']}" for c in commits]
     return log_data, gr.update(choices=choices), gr.update(choices=choices)
 
 
 def show_diff(commit_a_str, commit_b_str, show_discarded):
-    """Show diff between two commits."""
+    """Show diff between two commits, optionally including discarded experiment info."""
     if not commit_a_str or not commit_b_str:
         return "Select two commits to compare.", ""
     hash_a = commit_a_str.split(" - ")[0]
     hash_b = commit_b_str.split(" - ")[0]
     diff = git_history.get_diff(hash_a, hash_b)
-    annotation = f"Comparing {hash_a} -> {hash_b}"
+
+    # Build annotation with composite/gate/kept info from commit log
+    commits = git_history.get_train_py_log()
+    commit_map = {c["hash"][:7]: c for c in commits}
+    annotation_parts = [f"**Comparing {hash_a} -> {hash_b}**"]
+
+    for label, h in [("From", hash_a), ("To", hash_b)]:
+        info = commit_map.get(h)
+        if info:
+            comp = f"composite={info['composite']:.3f}" if info.get("composite") is not None else "composite=N/A"
+            kept = "KEPT" if "keep" in info.get("message", "").lower() else "DISCARDED"
+            annotation_parts.append(f"- **{label}** ({h}): {comp}, {kept}")
+
+    annotation = "\n".join(annotation_parts)
+
+    if show_discarded:
+        run_id = _run_manager.current_run_id
+        if not run_id:
+            # Try the most recent run
+            runs = data_loader.list_runs()
+            if runs:
+                run_id = runs[0]["run_id"]
+        if run_id:
+            discarded = git_history.get_discarded_diffs(run_id)
+            if discarded:
+                annotation += "\n\n### Discarded Experiments\n"
+                for d in discarded:
+                    gates = d.get("gate_results", {})
+                    gate_strs = [
+                        f"{'pass' if v else 'FAIL'}:{k}" for k, v in gates.items()
+                    ]
+                    annotation += (
+                        f"- Exp #{d['experiment']}: "
+                        f"composite={d['composite']:.3f}, "
+                        f"gates: {' '.join(gate_strs)}\n"
+                    )
+                    if d.get("change_description"):
+                        annotation += f"  Description: {d['change_description']}\n"
+
     return diff, annotation
 
 
@@ -284,7 +330,7 @@ def _build_optimization_tab():
         if not run_id:
             return (
                 state,
-                charts.composite_trend([]),
+                charts.enhanced_composite_trend([]),
                 charts.axis_improvement_heatmap([]),
                 charts.gate_pass_rate([]),
                 charts.cost_efficiency([]),
@@ -299,7 +345,7 @@ def _build_optimization_tab():
         metrics = state["metrics"]
         return (
             state,
-            charts.composite_trend(metrics),
+            charts.enhanced_composite_trend(metrics),
             charts.axis_improvement_heatmap(metrics),
             charts.gate_pass_rate(metrics),
             charts.cost_efficiency(metrics),

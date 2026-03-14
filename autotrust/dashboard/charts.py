@@ -67,6 +67,81 @@ def composite_trend(metrics: list[dict]) -> go.Figure:
     return fig
 
 
+def enhanced_composite_trend(metrics: list[dict]) -> go.Figure:
+    """Enhanced composite trend with baseline markers, best-so-far line, and improvement rate.
+
+    Used in the Optimization Dashboard tab for deeper analysis.
+    """
+    if not metrics:
+        return _empty_figure("Composite Score Trend (Enhanced)")
+
+    x = list(range(1, len(metrics) + 1))
+    y = [m.get("composite", 0.0) for m in metrics]
+    colors = ["green" if _is_kept(m) else "red" for m in metrics]
+
+    # Compute best-so-far line
+    best_so_far = []
+    running_best = 0.0
+    for score in y:
+        if score > running_best:
+            running_best = score
+        best_so_far.append(running_best)
+
+    fig = go.Figure()
+
+    # Main composite line
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y,
+            mode="lines+markers",
+            line={"color": "steelblue"},
+            marker={"color": colors, "size": 10},
+            name="Composite",
+        )
+    )
+
+    # Best-so-far step line
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=best_so_far,
+            mode="lines",
+            line={"color": "gold", "dash": "dot", "width": 2},
+            name="Best So Far",
+        )
+    )
+
+    # Baseline horizontal line (first experiment)
+    baseline = y[0]
+    fig.add_hline(
+        y=baseline,
+        line_dash="dash",
+        line_color="gray",
+        annotation_text=f"Baseline: {baseline:.3f}",
+    )
+
+    # Improvement rate annotation
+    if len(y) >= 2:
+        total_improvement = best_so_far[-1] - baseline
+        rate = total_improvement / (len(y) - 1)
+        fig.add_annotation(
+            x=x[-1],
+            y=best_so_far[-1],
+            text=f"Rate: {rate:+.4f}/exp",
+            showarrow=True,
+            arrowhead=2,
+            yshift=20,
+        )
+
+    fig.update_layout(
+        title="Composite Score Trend (Enhanced)",
+        xaxis_title="Experiment",
+        yaxis_title="Composite Score",
+    )
+    return fig
+
+
 def cost_burn(metrics: list[dict], budget_limit: float) -> go.Figure:
     """Cumulative cost line with budget threshold."""
     if not metrics:

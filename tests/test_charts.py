@@ -109,6 +109,32 @@ def test_stall_indicator_shows_count(sample_metrics):
 
 
 # ---------------------------------------------------------------------------
+# Enhanced composite trend (Issue 006)
+# ---------------------------------------------------------------------------
+
+
+def test_enhanced_composite_trend_has_baseline_and_best_so_far(sample_metrics):
+    """Enhanced trend includes baseline hline, best-so-far trace, and improvement rate."""
+    from autotrust.dashboard.charts import enhanced_composite_trend
+
+    fig = enhanced_composite_trend(sample_metrics)
+    assert isinstance(fig, go.Figure)
+    # Should have at least 2 traces: composite line + best-so-far line
+    assert len(fig.data) >= 2
+    trace_names = [t.name for t in fig.data]
+    assert "Composite" in trace_names
+    assert "Best So Far" in trace_names
+
+
+def test_enhanced_composite_trend_empty():
+    """Empty metrics returns empty figure."""
+    from autotrust.dashboard.charts import enhanced_composite_trend
+
+    fig = enhanced_composite_trend([])
+    assert isinstance(fig, go.Figure)
+
+
+# ---------------------------------------------------------------------------
 # Advanced charts (TASK_006)
 # ---------------------------------------------------------------------------
 
