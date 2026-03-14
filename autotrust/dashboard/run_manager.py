@@ -81,11 +81,19 @@ class RunManager:
 
     @property
     def status(self) -> str:
+        if self._status == "idle" and self._current_run_id is None:
+            # Check if there's an externally-started active run
+            ext_run = self._detect_active_run()
+            if ext_run is not None:
+                return "running (external)"
         return self._status
 
     @property
     def current_run_id(self) -> str | None:
-        return self._current_run_id
+        if self._current_run_id is not None:
+            return self._current_run_id
+        # Auto-detect the most recent active run (started from CLI or elsewhere)
+        return self._detect_active_run()
 
     @property
     def last_error(self) -> BaseException | None:
@@ -105,6 +113,36 @@ class RunManager:
         if not base_dir.exists():
             return set()
         return {e.name for e in base_dir.iterdir() if e.is_dir()}
+
+    @staticmethod
+    def _detect_active_run(base_dir: Path = Path("runs")) -> str | None:
+        """Find the most recent run that has metrics.jsonl but no summary.txt.
+
+        This detects runs started externally (e.g. via CLI) that are still in
+        progress. Also returns runs that have completed recently (have summary.txt)
+        if no active run exists, so the dashboard can display finished CLI runs.
+        """
+        if not base_dir.exists():
+            return None
+
+        active = []
+        completed = []
+        for entry in base_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            has_metrics = (entry / "metrics.jsonl").exists()
+            has_summary = (entry / "summary.txt").exists()
+            if has_metrics and not has_summary:
+                active.append(entry.name)
+            elif has_metrics and has_summary:
+                completed.append(entry.name)
+
+        # Prefer active (in-progress) runs; fall back to most recent completed
+        if active:
+            return sorted(active)[-1]
+        if completed:
+            return sorted(completed)[-1]
+        return None
 
     def _detect_run_id(self) -> None:
         """Detect the actual run_id by finding new directories in runs/."""

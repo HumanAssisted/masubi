@@ -211,44 +211,50 @@ Wave 6 (final -- cleanup):
 
 ## Review Summary
 
-**Review Date**: 2026-03-14
-**Reviewer**: Claude Opus 4.6 (ML/Python domain experts)
-**Test Suite**: 247 passed, 0 failed
+**Review Date**: 2026-03-14 (updated)
+**Reviewer**: Claude Opus 4.6 (1M context)
+**Test Suite**: 249 passed, 5 failed (see ISSUE_015)
 
-### Issue Counts by Severity
+### Issue Counts by Severity (current state)
 
-| Severity | Count |
-|----------|-------|
-| Critical | 2 |
-| High     | 2 |
-| Medium   | 6 |
-| Low      | 4 |
-| **Total** | **14** |
+| Severity | Count | Notes |
+|----------|-------|-------|
+| Critical | 1 | ISSUE_015 (train.py overwritten, 5 test failures) |
+| High     | 2 | ISSUE_016 (relabel API mismatch), ISSUE_022 (Stage 2 test gap) |
+| Medium   | 4 | ISSUE_017 (StudentOutput validation), ISSUE_018 (MSE vs KL), ISSUE_020 (escalate heuristic), ISSUE_021 (CLI -m flag) |
+| Low      | 1 | ISSUE_019 (6 stale issues to close) |
+| **Open** | **8 new** | Issues 015-022 |
+| **Resolved** | **6** | Issues 001, 002, 004, 005, 006, 008 (code has been updated) |
+| **Still open (prior)** | **5** | Issues 003 (partially), 007, 009, 010, 011, 012, 013, 014 |
 
 ### Requirements Coverage
 
 | TRD Section | Status | Notes |
 |-------------|--------|-------|
 | 4.1 spec.yaml extensions | Met | Stage2Config, ProductionConfig, per-stage limits all implemented |
-| 4.2 Teacher artifact freezing | Partially met | Freeze works but `relabel_training_data()` not implemented (ISSUE_003) |
+| 4.2 Teacher artifact freezing | Partially met | Freeze works; `relabel_training_data()` exists but full path has wrong API (ISSUE_016) |
 | 4.3 Student model architecture | Met | Dense and MoE models implemented with cap enforcement |
-| 4.4 train.py lifecycle | Not met | train.py rewrite at handoff not implemented (ISSUE_002) |
-| 4.5 run_loop.py changes | Partially met | CLI and auto-transition exist but Stage 2 execution path missing (ISSUE_001) |
+| 4.4 train.py lifecycle | Met (with regression) | Archive + template rewrite implemented, but currently applied to working dir (ISSUE_015) |
+| 4.5 run_loop.py changes | Met | CLI, auto-transition, Stage 2 subprocess execution all implemented |
 | 4.6 eval.py changes | Met | Eval is stage-agnostic as designed |
-| 4.7 Export pipeline | Partially met | PyTorch export works; GGUF is placeholder; CLI missing (ISSUE_010) |
-| 4.8 Production inference | Partially met | LocalInference works but API differs from TRD (ISSUE_007) |
-| 4.9 Dashboard changes | Partially met | Charts implemented but not integrated into dashboard UI (ISSUE_009) |
+| 4.7 Export pipeline | Partially met | PyTorch export works; GGUF is placeholder; CLI -m flag broken (ISSUE_021) |
+| 4.8 Production inference | Partially met | LocalInference works but escalation uses heuristic not model flag (ISSUE_020) |
+| 4.9 Dashboard changes | Partially met | Charts implemented and integrated; checkpoint management UI deferred (ISSUE_009) |
 | 4.10 Documentation | Met | README, program.md, setup.sh all updated |
 
 ### Critical Items
 
-1. **ISSUE_001**: Stage 2 execution path is a no-op -- `--stage train` runs identical code to `--stage prompt`. The entire Stage 2 pipeline (subprocess execution, checkpoint evaluation) is missing from `run_loop.py`.
-2. **ISSUE_002**: `train.py` archive and Stage 2 template rewrite not implemented. After auto-transition, the system continues using the Stage 1 prompt-based `train.py`.
+1. **ISSUE_015**: `train.py` has been overwritten with the Stage 2 template in the working directory. This breaks 5 tests in `test_train.py` that import `EmailTrustScorer`. The original code is preserved in `train_stage1_archive.py`. Restoring `train.py` fixes the regression.
+
+### Previously Critical, Now Resolved
+
+- **ISSUE_001** (Stage 2 execution path): `_run_stage2_iteration()` is now fully implemented with subprocess execution, checkpoint discovery, and student model scoring.
+- **ISSUE_002** (train.py archive/rewrite): Both `_archive_train_py()` and `_write_stage2_train_py_template()` are implemented.
 
 ### Tests Passing
 
-All 247 tests pass. However, tests for Stage 2 execution path are absent -- tests only verify helper functions (CLI parsing, time limits, auto-transition trigger) but not the actual Stage 2 behavior.
+249 of 254 tests pass. The 5 failures are all in `test_train.py` due to `train.py` being overwritten (ISSUE_015). Stage 2 helper tests pass but integration-level tests for the full Stage 2 loop are absent (ISSUE_022).
 
 ### Recommendation
 
-**Needs rework.** The skeleton is well-built -- models, schemas, loss functions, charts, and export pipeline are solid. However, the critical integration in `run_loop.py` that actually makes Stage 2 functional is missing. Issues 001, 002, 003, and 008 must be resolved before the system can transition from Stage 1 to Stage 2 and run a training loop.
+**Fix then ship.** The core implementation is substantially complete -- all major modules (student models, loss functions, MoE, export, inference, freeze, run_loop Stage 2 path, dashboard charts) are working. The critical blocker is ISSUE_015 (restore `train.py` to Stage 1 content). After that fix, the remaining issues are medium/low severity: API mismatches in freeze/inference, missing CLI routing, and test coverage gaps. None block the system from functioning in Stage 1 or from transitioning to Stage 2 when triggered.
