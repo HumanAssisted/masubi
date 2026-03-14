@@ -1,495 +1,425 @@
 ---
-name: AutoEmailTrust v3.2 Implementation
-overview: "Build AutoEmailTrust v3.2: autoresearch loop with clear infrastructure boundaries -- local LLMs (Ollama/MLX) for synthetic data gen, Hyperbolic for scoring model inference + GPU rental for LoRA training, Anthropic Opus as gold-standard judge. Thread-aware multi-task scorer, 9-dim trust vector, human-annotated gold set for judge calibration, hybrid safety policy."
+name: AutoEmailTrust v3.3 Lean
+overview: "AutoEmailTrust v3.3: lean autoresearch loop with 3 layers -- spec.yaml as single source of truth, fixed platform (providers, data, eval, observability), and train.py as the only mutable file. Provider registry for local/Hyperbolic/Anthropic. Human-annotated gold set for judge calibration. TDD-first platform code."
 todos:
   - id: scaffold
-    content: "Create pyproject.toml (uv, Python 3.12), .env.example, .gitignore with all deps (anthropic, openai, python-dotenv, gitpython, httpx, rich, datasets, scikit-learn, ollama)"
+    content: "Create pyproject.toml (uv, Python 3.12), .env.example, .gitignore, spec.yaml (trust axes, composite weights, provider bindings, limits, judge thresholds)"
     status: pending
-  - id: local-llm
-    content: "Build local_llm.py: Ollama/MLX wrapper for Dolphin 3.0 synthetic data generation (uncensored, free, offline)"
+  - id: core-platform
+    content: "Build config.py (typed spec.yaml loader), schemas.py (pydantic models for chains, trust vectors, run artifacts), providers.py (provider registry: GeneratorProvider, ScoringProvider, JudgeProvider, TrainingProvider)"
     status: pending
-  - id: hyperbolic-utils
-    content: "Build hyperbolic_utils.py: scoring model inference (OpenAI-compatible endpoint), GPU rental (list/rent/stop/status/ssh), BudgetGuard context manager, YaRN helper. NO synth gen, NO judge calls."
+  - id: data-eval
+    content: "Build data.py (train/eval/gold generation + calibration as subcommands) and eval.py (composite metric, judge fallback, gold-set gate, explanation quality -- all fixed evaluation policy in one file)"
     status: pending
-  - id: judge-rubric
-    content: "Build judge_rubric.py: Opus as primary judge (Anthropic API), configurable secondary judge, disagreement filter, gold-set calibration check, bias mitigations"
-    status: pending
-  - id: gold-set
-    content: "Build annotation workflow: generate 200 diverse chains, define annotation rubric for 9 axes, compute inter-annotator agreement (Cohen's Kappa), calibrate Opus judge against human consensus"
-    status: pending
-  - id: prepare
-    content: "Build prepare.py: real corpora loader (SpamAssassin + Enron, brands preserved), synthetic generator via local_llm (placeholders, no operational instructions), dual-judge labeling, Evol-Instruct + critic loop, 70/30 synth:real mix, --seed-eval flag"
+  - id: observe
+    content: "Build observe.py: structured logging (structlog), runs/<run_id>/ directory (metrics.json, predictions.jsonl, config.json, summary.txt)"
     status: pending
   - id: train
-    content: "Build train.py starter skeleton: thread-aware multi-task scorer (email embeddings -> thread attention -> per-axis heads) on Llama-3.1-8B via Hyperbolic inference, explanation generator, LoRA fine-tune via Unsloth"
-    status: pending
-  - id: program-md
-    content: "Create program.md v3.2 with updated agent instructions (thread encoder, 9-dim trust vector, local vs Hyperbolic vs Opus boundaries, FP penalty, explanation output)"
+    content: "Build train.py baseline: thread-aware EmailTrustScorer with explanation output, inference via ScoringProvider, LoRA fine-tune scaffolding via TrainingProvider"
     status: pending
   - id: run-loop
-    content: "Build run_loop.py: Anthropic tool-use orchestration, eval engine (9-dim trust vector + composite with FP penalty), git keep/discard, results.tsv logging, budget/time enforcement, gold-set regression check"
+    content: "Build run_loop.py: thin Anthropic tool-use orchestration, delegates to eval.py for scoring, observe.py for logging, git keep/discard cycle"
     status: pending
-  - id: eval-set
-    content: "Generate seed eval_set/ (1000 chains: 70% synthetic placeholders + 30% real with real brands from SpamAssassin/Enron) or create realistic fixture data"
+  - id: tests
+    content: "Write tests: unit (composite metric, escalation rules, safety filter, schema validation, gold gate), contract (provider mocks), smoke (10-chain eval + 1 loop cycle), regression (frozen gold-set + FP slice)"
     status: pending
-  - id: update-readme
-    content: "Update README.md with v3.2 architecture, infra boundaries, quickstart instructions, hybrid safety policy"
+  - id: docs
+    content: "Write program.md (tiny, references spec.yaml) and update README.md (architecture, quickstart, safety policy)"
     status: pending
 isProject: false
 ---
 
-# AutoEmailTrust v3.2 Implementation Plan
+# AutoEmailTrust v3.3 Lean
 
-Updates from v3.1: (1) Hyperbolic scoped to scoring model inference + GPU rental for training only, (2) new `local_llm.py` for synthetic data generation via Ollama/MLX (Dolphin 3.0, uncensored, free, offline), (3) LLM-as-judge is Opus via Anthropic API only with configurable secondary, (4) human annotation workflow as pre-build calibration step for judge quality.
+Rewrite of v3.2 following the autoresearch philosophy: one mutable file (`train.py`), one fixed evaluation/data layer, one thin orchestration layer. All configuration lives in `spec.yaml`. No duplicated rules.
 
-## Infrastructure Boundaries
-
-```mermaid
-flowchart LR
-    subgraph local [Local Machine - MacBook]
-        LocalLLM["local_llm.py\nDolphin 3.0 via Ollama/MLX"]
-        SynthGen["Synthetic Data Generation\n(uncensored, free, offline)"]
-        LocalLLM --> SynthGen
-    end
-
-    subgraph hyperbolic [Hyperbolic Cloud]
-        HypInference["Scoring Model Inference\n(Llama-3.1-8B via OpenAI API)"]
-        HypGPU["GPU Rental - H100 clusters\n(LoRA fine-tuning, max $8/exp)"]
-    end
-
-    subgraph anthropic [Anthropic API]
-        Sonnet["Claude Sonnet\n(orchestration, agent loop)"]
-        Opus["Claude Opus\n(gold-standard judge)"]
-    end
-
-    subgraph configurable [Configurable Secondary Judge]
-        Judge2["Sonnet / local model / other\n(disagreement check)"]
-    end
-```
-
-**Rule**: Each service does exactly one job. No bleed-through.
-
-| Role | Service | Rationale |
-|------|---------|-----------|
-| Synthetic data gen | Local Ollama/MLX (Dolphin 3.0) | Free, uncensored, no API deps, iterate offline |
-| Scoring model inference | Hyperbolic (OpenAI-compatible) | Configurable model, serves fine-tuned checkpoints |
-| LoRA fine-tuning | Hyperbolic GPU rental (H100) | On-demand compute, auto-terminate at budget |
-| Orchestration | Anthropic Sonnet | Drives the autoresearch loop via tool-use |
-| Gold-standard judge | Anthropic Opus | Highest quality, calibrated against human annotations |
-| Secondary judge | Configurable | Sonnet, local model, or other -- for disagreement filtering |
-
-## Architecture Overview
+## 3-Layer Architecture
 
 ```mermaid
 flowchart TD
-    RunLoop["run_loop.py\n(Orchestration via Sonnet)"] -->|"reads"| ProgramMD["program.md v3.2"]
-    RunLoop -->|"calls Anthropic API"| Sonnet["Claude Sonnet"]
-    Sonnet -->|"edits only"| Train["train.py\n(THE file the agent edits)"]
-    RunLoop -->|"runs"| Eval["Evaluation"]
-    Eval -->|"loads"| EvalSet["eval_set/\n(1000 held-out: 70% synth, 30% real)"]
-    Eval -->|"regression check"| GoldSet["gold_set/\n(200 human-annotated chains)"]
-
-    subgraph scoring [Hybrid Scoring Pipeline]
-        ThreadEnc["Thread Encoder\n(email embeds -> attention)"]
-        FastScore["Multi-task Heads via Hyperbolic\n(phish, manipulation,\nclassic, authority_impersonation)"]
-        Threshold{"subtle axis\nuncertain?"}
-        JudgePipeline["Judge Pipeline\n(Opus primary +\nconfigurable secondary)"]
-        ExplGen["Explanation Generator\n(why suspicious)"]
+    subgraph specLayer [Layer 1: Spec/Config]
+        Spec["spec.yaml\n(single source of truth)"]
+        Config["config.py\n(typed loader)"]
+        Schemas["schemas.py\n(pydantic models)"]
+        Spec --> Config
+        Config --> Schemas
     end
 
-    Eval --> ThreadEnc
-    ThreadEnc --> FastScore
-    FastScore --> Threshold
-    Threshold -->|"yes"| JudgePipeline
-    Threshold -->|"no"| TrustVector
-    JudgePipeline --> TrustVector["Trust Vector (9-dim)"]
-    FastScore --> ExplGen
-    TrustVector -->|"weighted sum - FP penalty"| Composite["Composite Scalar"]
-    Composite -->|"delta check"| GitDecision{"keep or discard?"}
-    GitDecision -->|"improved + gold-set OK"| GitKeep["git commit + results.tsv"]
-    GitDecision -->|"regressed OR gold-set degraded"| GitDiscard["git checkout -- train.py"]
+    subgraph platformLayer [Layer 2: Fixed Platform]
+        Providers["providers.py\n(registry: generator, scorer,\njudge, trainer)"]
+        Data["data.py\n(build-train, build-eval,\nbuild-gold, calibrate-judge)"]
+        EvalMod["eval.py\n(composite metric, judge fallback,\ngold-set gate, explanation quality)"]
+        Observe["observe.py\n(structured logs, run artifacts)"]
+    end
 
-    Prepare["prepare.py (FIXED)"] -->|"loads real\n(brands preserved)"| RealCorpora["SpamAssassin + Enron"]
-    Prepare -->|"generates synth\n(placeholders only)"| LocalLLM["local_llm.py\n(Dolphin 3.0 via Ollama)"]
-    Prepare -->|"dual-judge\nlabeling"| DualJudgeLabel["Opus + configurable\nsecondary judge"]
-    Prepare -->|"writes"| SynthData["synth_data/ JSONL"]
+    subgraph mutableLayer [Layer 3: Mutable Model]
+        TrainPy["train.py\n(ONLY agent-editable file)"]
+    end
 
-    Sonnet -->|"when gains stall"| HypGPU["Hyperbolic GPU Rental\n(H100 cluster, max $8)"]
-    HypGPU -->|"LoRA fine-tune"| LoRA["Unsloth/Axolotl\non synth_data"]
+    RunLoop["run_loop.py\n(thin orchestration)"]
+    ProgramMD["program.md\n(tiny, references spec.yaml)"]
+
+    Config --> Providers
+    Config --> Data
+    Config --> EvalMod
+    Config --> RunLoop
+    Providers --> Data
+    Providers --> EvalMod
+    Providers --> TrainPy
+    Providers --> RunLoop
+    EvalMod --> RunLoop
+    Observe --> RunLoop
+    ProgramMD --> RunLoop
+    TrainPy --> RunLoop
 ```
 
-## File Structure
+## File Layout
 
 ```
 autoresearch-helpful/
-├── pyproject.toml           # uv project config, all deps
-├── .env.example             # template for API keys
-├── .env                     # (gitignored) actual keys
+├── pyproject.toml
+├── .env.example
 ├── .gitignore
-├── README.md                # updated with v3.2 architecture + quickstart
-├── program.md               # v3.2 agent instruction set
-├── run_loop.py              # orchestration: Anthropic Sonnet -> edit -> eval -> git
-├── prepare.py               # FIXED: real corpora + local LLM synthetic generator
-├── train.py                 # ONLY file the agent edits (thread-aware scorer + LoRA)
-├── local_llm.py             # NEW: Ollama/MLX wrapper for synth data gen
-├── hyperbolic_utils.py      # scoring model inference + GPU rental (NO synth gen)
-├── judge_rubric.py           # Opus primary + configurable secondary judge
-├── annotation_rubric.md     # NEW: human annotation guidelines for gold set
-├── gold_set/                # NEW: 200 human-annotated chains (calibration)
+├── spec.yaml                # single source of truth
+├── autotrust/
+│   ├── __init__.py
+│   ├── config.py            # typed settings loader
+│   ├── schemas.py           # pydantic models
+│   ├── providers.py         # local / hyperbolic / anthropic adapters
+│   ├── data.py              # train/eval/gold generation + calibration
+│   ├── eval.py              # fixed metrics, judge fallback, gold-set gate
+│   └── observe.py           # logging, run artifacts
+├── train.py                 # ONLY agent-editable file
+├── run_loop.py              # thin orchestration
+├── program.md               # tiny instruction set
+├── annotation_rubric.md     # human scoring guidelines
+├── README.md
+├── gold_set/
 │   └── gold_chains.jsonl
-├── eval_set/                # 1,000 held-out chains (70% synth + 30% real)
+├── eval_set/
 │   └── eval_chains.jsonl
-├── synth_data/              # generated synthetic training data
+├── synth_data/
 │   └── .gitkeep
-└── results.tsv              # auto-logged experiment results
+├── runs/                    # per-experiment artifacts
+│   └── .gitkeep
+└── tests/
+    ├── test_composite_metric.py
+    ├── test_escalation_rules.py
+    ├── test_safety_filter.py
+    ├── test_schema_validation.py
+    ├── test_gold_gate.py
+    ├── test_providers.py     # contract tests
+    └── test_smoke.py         # 10-chain eval + 1 loop cycle
 ```
 
-## What Changed from v3.1 to v3.2
+## `spec.yaml` -- Single Source of Truth
 
-### Change 1: Hyperbolic Scoped to Scoring + Training Only
-- `hyperbolic_utils.py` **loses**: all synthetic data generation, judge inference
-- `hyperbolic_utils.py` **keeps**: scoring model inference (OpenAI-compatible endpoint for Llama-3.1-8B), GPU rental for LoRA fine-tuning, BudgetGuard, YaRN helper
-- Rationale: Hyperbolic is compute infrastructure, not a content generation service
+Every metric, threshold, provider binding, and trust-axis definition lives here. All other files read from it.
 
-### Change 2: New `local_llm.py` for Synthetic Data Generation
-- Wraps Ollama (or MLX) for running Dolphin 3.0 locally on MacBook
-- Uncensored model, free inference, no API dependencies, iterate on prompt templates offline
-- `prepare.py` calls `local_llm` instead of Hyperbolic for all data generation
-- No guardrail friction from API providers -- critical for generating realistic structural malicious examples
+```yaml
+trust_axes:
+  - truthfulness
+  - verify_by_search
+  - manipulation
+  - deceit
+  - vulnerability_risk
+  - subtle_toxicity
+  - polarization
+  - classic_email_metrics
+  - authority_impersonation
 
-### Change 3: Judge = Opus Only (with Configurable Secondary)
-- Primary judge: Claude Opus via direct Anthropic API calls. Gold standard.
-- Secondary judge: configurable (Sonnet, local model via Ollama, or other). Used for disagreement filtering.
-- `judge_rubric.py` no longer calls Hyperbolic 405B
-- Self-enhancement bias mitigation now comes from model diversity (Opus vs different secondary) rather than Opus vs 405B
+composite_weights:
+  phish_f1: 0.22
+  truth_agreement: 0.18
+  manipulation: 0.13
+  deceit_recall: 0.10
+  vulnerability_risk: 0.10
+  subtle_toxicity: 0.08
+  polarization: 0.05
+  classic_email_metrics: 0.04
+  authority_impersonation: 0.10
+  false_positive_rate: -0.15
 
-### Change 4: Human Annotation Workflow (Gold Set)
-- **Pre-build step** before the autoresearch loop can run
-- Generate 200 diverse email chains (mix of real SpamAssassin/Enron + synthetic from Dolphin)
-- Define `annotation_rubric.md` with clear scoring guidelines for all 9 trust axes
-- Have 2-3 annotators score each chain independently
-- Compute inter-annotator agreement (Cohen's Kappa) per axis
-- Measure Opus judge correlation with human consensus per axis
-- Any axis with Opus-human Kappa < 0.7 is flagged as unreliable for automated eval -- those axes require human spot-checking in the loop
-- Gold set serves as regression test: if autoresearch improves composite but degrades gold-set agreement on any axis, the change is rejected
+providers:
+  generator:
+    backend: local_ollama
+    model: dolphin3:latest
+  scorer:
+    backend: hyperbolic
+    model: meta-llama/Llama-3.1-8B-Instruct
+  judge_primary:
+    backend: anthropic
+    model: claude-opus-4-20250514
+  judge_secondary:
+    backend: anthropic
+    model: claude-sonnet-4-20250514
+  trainer:
+    backend: hyperbolic_gpu
+    gpu_type: H100
+
+limits:
+  experiment_minutes: 15
+  max_spend_usd: 8
+
+judge:
+  escalate_threshold: 0.60
+  disagreement_max: 0.20
+  min_gold_kappa: 0.70
+
+safety:
+  synth_placeholder_only: true
+  block_operational_instructions: true
+  real_brands_in_eval: true
+
+data:
+  eval_set_size: 1000
+  gold_set_size: 200
+  synth_real_ratio: 0.7
+  train_val_test_split: [0.70, 0.15, 0.15]
+```
 
 ## Implementation Details
 
-### 1. Project Setup (`pyproject.toml`, `.env.example`, `.gitignore`)
+### 1. Scaffold
 
-- **`pyproject.toml`**: Python 3.12, managed by uv. Dependencies:
-  - `anthropic` (Sonnet for orchestration, Opus for judge)
-  - `openai` (Hyperbolic scoring model inference, OpenAI-compatible)
-  - `ollama` (local LLM wrapper for synth data gen)
-  - `python-dotenv` (load `.env`)
-  - `GitPython` (programmatic git keep/discard)
-  - `httpx` (Hyperbolic Marketplace API for GPU rental)
-  - `rich` (logging + experiment output)
-  - `datasets` (loading SpamAssassin / Enron corpora from HuggingFace)
-  - `scikit-learn` (F1 score, classification metrics, Cohen's Kappa)
-  - Dev deps: `pytest`, `ruff`
+- **`pyproject.toml`**: Python 3.12, uv-managed. Dependencies:
+  - `anthropic`, `openai` (Hyperbolic uses OpenAI-compatible endpoint), `ollama`
+  - `python-dotenv`, `pydantic`, `pyyaml`
+  - `gitpython`, `httpx`, `rich`, `structlog`
+  - `datasets`, `scikit-learn`
+  - Dev: `pytest`, `ruff`
 - **`.env.example`**: `ANTHROPIC_API_KEY=`, `HYPERBOLIC_API_KEY=`, `OLLAMA_MODEL=dolphin3:latest`
-- **`.gitignore`**: `.env`, `synth_data/*.jsonl`, `__pycache__/`, `.venv/`, `results.tsv`
+- **`.gitignore`**: `.env`, `synth_data/*.jsonl`, `runs/`, `__pycache__/`, `.venv/`
+- **`spec.yaml`**: as above
 
-### 2. `local_llm.py` -- Local Inference for Synthetic Data (NEW)
+### 2. `config.py` -- Typed Settings Loader
 
-Wraps Ollama (primary) and MLX (fallback) for running uncensored models locally:
+- `load_spec(path="spec.yaml") -> Spec` -- loads and validates spec.yaml into a typed pydantic model
+- `get_spec() -> Spec` -- cached singleton
+- All other modules import `get_spec()` instead of hardcoding values
+- Validates provider bindings, weight sum, axis names at load time
 
-- `LocalLLM` class:
-  - `__init__(model="dolphin3:latest", backend="ollama")` -- configurable model and backend
-  - `generate(prompt, temperature=0.8, max_tokens=4096)` -- single completion
-  - `generate_batch(prompts, concurrency=4)` -- parallel local generation
-  - `check_available()` -- verify Ollama is running and model is pulled
-- Uses the `ollama` Python package for Ollama backend
-- MLX fallback for Apple Silicon native inference (optional)
-- No API keys required, no per-token cost, no content filtering
+### 3. `schemas.py` -- Pydantic Models
 
-### 3. `hyperbolic_utils.py` -- Scoring Inference + GPU Rental
+Core data models used everywhere:
 
-Scoped down from v3.1. Two sections only:
+- `Email` -- single email message (from, to, subject, body, timestamp, reply_depth)
+- `EmailChain` -- full chain with metadata (chain_id, source, emails, thread_depth, labels, trust_vector, composite, judge/safety flags)
+- `TrustVector` -- 9-dim vector with named axes (dynamically built from spec.yaml trust_axes list)
+- `ExperimentResult` -- per-experiment record (run_id, change_description, per_axis_scores, composite, fp_rate, judge_agreement, gold_agreement, cost, wall_time)
+- `RunArtifacts` -- paths to metrics.json, predictions.jsonl, config.json, summary.txt
+- `GoldChain` -- extends EmailChain with annotator_scores, consensus_labels, inter_annotator_kappa, opus_agreement
 
-**A. Scoring Model Inference (OpenAI-compatible)**
-- `get_inference_client()` -- returns `openai.OpenAI` configured with Hyperbolic base URL and key
-- `score_completion(prompt, model="meta-llama/Llama-3.1-8B-Instruct", ...)` -- wrapper with retry logic for the scoring model
-- `score_batch(prompts, ...)` -- concurrent batch scoring via asyncio
-- Can serve fine-tuned model checkpoints after LoRA training
+### 4. `providers.py` -- Provider Registry
 
-**B. GPU Rental for Training (Marketplace API via httpx)**
-- `list_available_gpus(gpu_type="H100")` -- `GET /v1/marketplace`
-- `rent_gpu(cluster_id, hours, name)` -- `POST /v1/marketplace/instances`
-- `stop_gpu(instance_id)` -- terminate instance
-- `get_gpu_status(instance_id)` -- check running/cost
-- `run_remote_command(instance_id, command)` -- SSH exec wrapper
-- `BudgetGuard` context manager -- tracks spend, auto-terminates at $8 limit
-- `yarn_extend_context(base_model, target_ctx_len, finetune_steps=400)` -- YaRN config for rented GPU
+One module, four provider interfaces, configured from spec.yaml:
 
-**NOT in this file**: synthetic data generation (that's `local_llm.py`), judge calls (that's `judge_rubric.py` via Anthropic API)
-
-### 4. `judge_rubric.py` -- Opus Primary + Configurable Secondary
-
-Judges via Anthropic API only (no Hyperbolic inference):
-
-- `JudgeRubric` class:
-  - `__init__(primary_model="claude-opus-4-20250514", secondary_model="claude-sonnet-4-20250514")` -- configurable model pairing
-  - `judge_chain(chain, axes=["subtle_toxicity", "deceit", "polarization", "vulnerability_risk", "authority_impersonation"])` -- Opus primary judge, returns per-axis scores with rationale
-  - `should_escalate(fast_scores: dict, threshold=0.6)` -- determines if fast scorer output needs judge review
-  - `dual_judge_label(chain)` -- Opus scores -> adversarial generator -> secondary judge independently scores -> disagreement filter
-  - `disagreement_filter(scores1, scores2, max_divergence=0.2)` -- True if judges agree, False to discard
-  - `calibrate_against_gold(gold_set_path)` -- computes per-axis Opus-human Kappa, flags unreliable axes (Kappa < 0.7)
-  - `gold_set_regression_check(predictions, gold_set_path)` -- returns True if no axis degrades vs human labels
-- **Bias mitigations** (baked into prompt construction):
-  - Position bias: randomize presentation order of email messages
-  - Verbosity bias: instruct judge to score based on substance not length
-  - Self-enhancement bias: primary and secondary are different models (Opus vs Sonnet/local)
-- Uses direct `anthropic` client for both primary and secondary (or `local_llm` for local secondary)
-- Returns structured JSON matching the 9-dim trust vector schema
-
-### 5. `annotation_rubric.md` + Gold Set Workflow (NEW)
-
-**Pre-build calibration step.** Must complete before the autoresearch loop runs.
-
-**A. `annotation_rubric.md`** -- human annotation guidelines:
-- Clear definitions for each of the 9 trust axes with examples at 0.0, 0.5, and 1.0
-- Specific decision criteria for binary axes (phish, verify_by_search_flag)
-- Edge case guidance (e.g., legitimate urgency vs manipulative urgency)
-- Instructions for handling ambiguous chains
-
-**B. Gold set generation workflow:**
-1. Generate 200 diverse chains: ~60 from SpamAssassin, ~60 from Enron threads, ~80 synthetic from Dolphin 3.0
-2. Export to annotation format (chain + blank scoring sheet per axis)
-3. 2-3 annotators independently score each chain on all 9 axes using the rubric
-4. Compute inter-annotator agreement (Cohen's Kappa) per axis
-5. Resolve disagreements via discussion for consensus labels
-6. Save to `gold_set/gold_chains.jsonl` with consensus labels + per-annotator raw scores
-7. Run `judge_rubric.calibrate_against_gold()` to measure Opus alignment per axis
-8. Any axis with Kappa < 0.7 is flagged -- those axes require human spot-checking during autoresearch
-
-**Gold set schema (extends base chain schema):**
 ```python
-{
-    ...base chain fields...,
-    "annotator_scores": {
-        "annotator_1": {"phish": 1, "truthfulness": 0.3, ...},
-        "annotator_2": {"phish": 1, "truthfulness": 0.4, ...},
-        "annotator_3": {"phish": 1, "truthfulness": 0.35, ...}
-    },
-    "consensus_labels": {"phish": 1, "truthfulness": 0.35, ...},
-    "inter_annotator_kappa": {"phish": 0.85, "truthfulness": 0.72, ...},
-    "opus_agreement": {"phish": 0.92, "truthfulness": 0.78, ...}
-}
+class GeneratorProvider:    # local_ollama | local_mlx
+    generate(prompt, ...) -> str
+    generate_batch(prompts, concurrency=4) -> list[str]
+    check_available() -> bool
+
+class ScoringProvider:      # hyperbolic
+    score(prompt, ...) -> str
+    score_batch(prompts, ...) -> list[str]
+
+class JudgeProvider:        # anthropic (Opus or Sonnet)
+    judge(chain, axes) -> dict
+    dual_judge(chain) -> tuple[dict, dict, float]  # scores1, scores2, agreement
+
+class TrainingProvider:     # hyperbolic_gpu
+    list_gpus() -> list
+    rent_gpu(hours, name) -> str
+    stop_gpu(instance_id) -> None
+    get_status(instance_id) -> dict
+    run_remote(instance_id, command) -> str
+    budget_guard(max_usd) -> ContextManager
 ```
 
-### 6. `prepare.py` -- Data Pipeline (FIXED, never edited by agent)
+- Shared retry logic, auth loading, error handling, structured logging -- written once
+- `get_provider(role: str) -> Provider` factory reads spec.yaml to instantiate the right backend
+- Hyperbolic inference and Ollama both use OpenAI-compatible client pattern (swap `base_url` + `api_key`)
+- Anthropic uses direct `anthropic.Anthropic` client
+- GPU rental uses `httpx` for Hyperbolic Marketplace API
 
-Two data sources with hybrid safety and dual-judge labeling. **Now calls `local_llm.py` for generation, not Hyperbolic.**
+### 5. `data.py` -- Fixed Data Module
 
-**A. Real Corpora Loader (real brands preserved)**
-- `load_spamassassin()` -- downloads SpamAssassin public corpus, parses into email chain format. Real brand names kept as-is
-- `load_enron_threads()` -- loads Enron email dataset, filters to multi-message chains. Real names/companies preserved
-- Labels real emails using `judge_rubric.judge_chain()` (Opus) for ground truth on all 9 axes
+All dataset behavior in one file, invoked as subcommands:
 
-**B. Synthetic Generator (via local_llm, placeholders only, no operational instructions)**
-1. Generate 150-200 seed threads using `local_llm.generate()` (Dolphin 3.0 via Ollama) -- benign + structural malicious
-2. **Safety filter**: reject examples containing operational phishing instructions. Real brand names replaced with placeholders in synthetic data only
-3. Evol-Instruct (4 epochs): progressively increase complexity using `local_llm` for each iteration
-4. SpearBot-style critic loop: generate -> critic (local) evaluates detectability -> refine until subtle
-5. **Dual-judge labeling**: Opus primary scores -> adversarial generator (local) -> secondary judge scores -> disagreement filter discards low-confidence labels
-6. Deduplicate via embedding similarity
-
-**C. Data Splits**
-- `--seed-eval`: generates 1,000 held-out chains (70% synthetic with placeholders, 30% real with real brands) for `eval_set/eval_chains.jsonl`
-- `--generate-train N`: generates N training chains to `synth_data/`
-- `--generate-gold 200`: generates 200 chains for human annotation (outputs annotation-ready format)
-- 70/15/15 train/val/test split within training data
-
-**Schema per email chain (9-dim):**
-```python
-{
-    "chain_id": "uuid",
-    "source": "synthetic" | "spamassassin" | "enron",
-    "emails": [
-        {
-            "from": "...",
-            "to": "...",
-            "subject": "...",
-            "body": "...",
-            "timestamp": "...",
-            "reply_depth": int
-        }
-    ],
-    "thread_depth": int,
-    "labels": {
-        "phish": 0 | 1,
-        "truthfulness": 0.0-1.0,
-        "verify_by_search_flag": true | false,
-        "manipulation": 0.0-1.0,
-        "deceit": 0.0-1.0,
-        "vulnerability_risk": 0.0-1.0,
-        "subtle_toxicity": 0.0-1.0,
-        "polarization": 0.0-1.0,
-        "classic_email_metrics": 0.0-1.0,
-        "authority_impersonation": 0.0-1.0
-    },
-    "trust_vector": [float, ...],
-    "composite_trust_score": float,
-    "dual_judge_validated": bool,
-    "judge_agreement": float,
-    "safety_checked": true
-}
+```bash
+uv run python -m autotrust.data build-train --count 5000
+uv run python -m autotrust.data build-eval
+uv run python -m autotrust.data build-gold
+uv run python -m autotrust.data annotate-export    # exports chains for human annotation
+uv run python -m autotrust.data calibrate-judge    # measures Opus-human Kappa per axis
 ```
 
-### 7. `train.py` -- Starter Skeleton (the ONLY file the agent edits)
+Internally:
 
-Thread-aware architecture with explanation output. **Inference runs on Hyperbolic, not locally.**
+**Real corpora loader:**
+- `load_spamassassin()` -- SpamAssassin corpus, real brands preserved
+- `load_enron_threads()` -- Enron dataset, multi-message chains, real names preserved
+- Labels via JudgeProvider (Opus)
+
+**Synthetic generator (via GeneratorProvider = local Ollama):**
+1. Seed threads from Dolphin 3.0 (benign + structural malicious, placeholders only)
+2. Safety filter: reject operational phishing instructions (regex + blocklist from spec.yaml safety config)
+3. Evol-Instruct (4 epochs via GeneratorProvider)
+4. SpearBot-style critic loop (generate -> critic -> refine)
+5. Dual-judge labeling via JudgeProvider (primary + secondary, disagreement filter)
+6. Deduplicate
+
+**Gold set workflow:**
+1. `build-gold`: generates 200 diverse chains (mix of real + synthetic)
+2. `annotate-export`: outputs annotation-ready format for human scorers
+3. `calibrate-judge`: ingests human annotations, computes Cohen's Kappa per axis, measures Opus alignment, flags axes with Kappa < min_gold_kappa from spec.yaml
+
+**Data schema:** same 9-dim EmailChain from schemas.py. Gold chains extend with annotator scores and Kappa values.
+
+### 6. `eval.py` -- Fixed Evaluation Policy
+
+All scoring contract, judge escalation, gold-set gating, and metric math in one file:
+
+```python
+def score_predictions(predictions: list, ground_truth: list, spec: Spec) -> dict:
+    """Per-axis metrics: F1 for binary, agreement for continuous."""
+
+def compute_composite(per_axis: dict, spec: Spec) -> float:
+    """Weighted sum from spec.yaml composite_weights, including FP penalty."""
+
+def run_judge_fallback(chain, fast_scores, judge: JudgeProvider, spec: Spec) -> dict:
+    """Escalate to judge if any subtle axis > escalate_threshold."""
+
+def gold_regression_gate(predictions, gold_set, previous_best, spec: Spec) -> bool:
+    """Returns True if change is acceptable (no axis degrades vs human labels)."""
+
+def explanation_quality(explanations, ground_truth_axes) -> float:
+    """Does the explanation mention the correct flagged axes?"""
+```
+
+- Reads all thresholds, weights, and axis lists from spec.yaml via config
+- This is the most important DRY move: the scoring contract exists in exactly one place
+
+### 7. `observe.py` -- Structured Logging + Run Artifacts
+
+Lean observability layer using `structlog`:
+
+- `init_logging()` -- configure structlog with JSON output
+- `start_run(spec) -> RunContext` -- creates `runs/<run_id>/` directory, snapshots config.json
+- `log_experiment(ctx, result: ExperimentResult)` -- writes to metrics.json
+- `log_predictions(ctx, predictions)` -- writes predictions.jsonl
+- `finalize_run(ctx)` -- writes summary.txt
+- `export_leaderboard(runs_dir) -> str` -- derives CSV/TSV from all runs (optional convenience)
+
+No OpenTelemetry at this stage. Structured logs + JSON artifacts are sufficient for the autoresearch loop. OTLP can be layered in later if needed.
+
+### 8. `train.py` -- The Only Mutable File
+
+Baseline scorer the autoresearch agent will iterate on:
 
 - `EmailTrustScorer` class:
-  - `score_chain(chain: dict) -> dict` -- returns 9-dim trust vector + composite scalar + explanation
-  - `score_batch(chains: list) -> list` -- batch scoring
-  - `explain(chain: dict) -> str` -- structured explanation of why email is suspicious
-- **Thread encoder architecture** (baseline the agent improves):
-  - Per-email embedding via Llama-3.1-8B on Hyperbolic (each email encoded separately)
-  - Attention over thread sequence (captures reply timing, escalation, persuasion progression)
-  - Chain-level classifier with per-axis heads
-  - Initial implementation: thread-aware prompt via `hyperbolic_utils.score_completion()` that explicitly asks about inter-message patterns
-  - The agent evolves this toward actual model heads via LoRA
-- **Key signals the thread encoder should capture:**
-  - Reply timing and urgency escalation
-  - Authority shifts (casual -> authoritative)
-  - Persuasion progression (rapport -> small ask -> big ask)
-  - Social engineering buildup patterns
-  - Authority impersonation ("Hi this is the CFO")
-- **Explanation generator:**
-  - Outputs structured reasons: e.g. "authority impersonation, urgent financial request, unverifiable claim"
-  - Extracted from chain-of-thought reasoning during scoring
-- **LoRA fine-tune scaffolding** (agent fills in):
-  - `fine_tune(data_path, gpu_instance_id)` -- placeholder for Unsloth/Axolotl training code on rented Hyperbolic GPU
-  - `load_fine_tuned(checkpoint_path)` -- loads LoRA adapter weights
-- Uses `hyperbolic_utils` for all inference and GPU operations
+  - `score_chain(chain) -> dict` -- returns 9-dim trust vector + composite + explanation
+  - `score_batch(chains) -> list` -- batch scoring
+  - `explain(chain) -> str` -- structured reasons
+- **Initial baseline:** thread-aware prompt via ScoringProvider (Hyperbolic Llama-3.1-8B) that asks about inter-message patterns, authority impersonation, persuasion progression
+- **Thread encoder signals:** reply timing, escalation, authority shifts, social engineering buildup
+- **LoRA scaffolding:** `fine_tune(data_path, trainer: TrainingProvider)` and `load_fine_tuned(checkpoint)` as placeholders
+- Uses providers from `providers.py` -- never constructs clients directly
 
-The composite metric formula is hardcoded in `run_loop.py`'s evaluator, not in `train.py`.
+### 9. `run_loop.py` -- Thin Orchestration
 
-### 8. `program.md` -- Agent Instructions (v3.2)
+Minimal loop that delegates everything to the platform layer:
 
-Updated instruction set with clear infrastructure boundaries:
+```python
+spec = get_spec()
+scorer = get_provider("scorer")
+judge = get_provider("judge_primary")
+run_ctx = start_run(spec)
+
+while experiment_count < max_experiments:
+    # 1. Call Sonnet with program.md + train.py + last N results
+    # 2. Apply proposed edit to train.py
+    # 3. predictions = score all eval chains via train.py
+    # 4. metrics = eval.score_predictions(predictions, ground_truth, spec)
+    # 5. composite = eval.compute_composite(metrics, spec)
+    # 6. gold_ok = eval.gold_regression_gate(predictions, gold_set, prev_best, spec)
+    # 7. if improved AND gold_ok: git commit, log success
+    #    else: git checkout -- train.py, log regression
+    # 8. observe.log_experiment(run_ctx, result)
+    # 9. if 3 consecutive no-improvement: nudge toward LoRA
+    # 10. enforce budget/time from spec.limits
+```
+
+Tool definitions passed to Anthropic:
+- `edit_train(new_content)`, `run_evaluation()`, `rent_gpu(...)`, `stop_gpu(...)`, `run_remote(...)`, `get_experiment_history()`
+
+### 10. `program.md` -- Tiny Instruction Set
+
+Short and references spec.yaml for authority:
 
 ```
-You are optimizing the world's best content-only email trust scorer using the autoresearch loop.
+You are optimizing a content-only email trust scorer.
 
-Infrastructure (do NOT change):
-- Scoring inference: Hyperbolic API (Llama-3.1-8B or your fine-tuned variant)
-- LoRA training: Hyperbolic GPU rental (H100, max $8/experiment)
-- Judge: Claude Opus via Anthropic API (you don't call this directly)
-- Synth data: generated offline via local LLM (you don't call this directly)
-
-Rules (immutable):
+Rules:
 - Only edit train.py
-- Every experiment <= 15 min wall time OR <= $8 Hyperbolic spend
-- Use Llama-3.1-8B (or YaRN-extended) base
-- Changes that degrade gold-set agreement on any axis are automatically rejected
+- Budget: see spec.yaml limits (currently 15 min / $8)
+- Base model: see spec.yaml providers.scorer (currently Llama-3.1-8B on Hyperbolic)
+- Changes that degrade gold-set agreement on any axis are auto-rejected
 
-Metric (do NOT change):
-trust_vector = [truthfulness, verify_by_search_flag, manipulation, deceit,
-                vulnerability_given_ask, subtle_toxicity, polarization,
-                classic_metrics, authority_impersonation]
-composite = (0.22*phish_f1 + 0.18*truth_agreement + 0.13*manipulation
-           + 0.10*deceit_recall + 0.10*vuln_risk + 0.08*toxicity
-           + 0.05*polarization + 0.04*classic + 0.10*authority_impersonation)
-           - 0.15*false_positive_rate
+Trust axes and composite weights are defined in spec.yaml. Do not change them.
 
 Priorities:
-1. Thread encoder: email embeddings -> attention over thread -> chain classifier
-2. Multi-task heads for phishing/manipulation/classic/authority_impersonation
+1. Thread encoder: per-email embeddings -> attention over thread -> chain classifier
+2. Multi-task heads for solved axes (phish, manipulation, classic, authority_impersonation)
 3. Explanation output: structured reasons why email is suspicious
-4. When gains stall -> YaRN context extension OR larger base model swap
-5. Log false positive rate and per-axis scores every experiment
+4. When gains stall: LoRA fine-tune via TrainingProvider (auto-terminate GPUs)
 
-If you rent GPUs, terminate before ending experiment.
 Start now.
 ```
 
-### 9. `run_loop.py` -- Autoresearch Orchestration
+## Test Strategy
 
-The core loop, driven by plain Anthropic API calls (Sonnet for orchestration):
+Platform code is heavily tested. `train.py` is lightly smoke-tested but free to evolve.
 
-```
-while experiment_count < max_experiments:
-    1. Call Claude Sonnet with:
-       - program.md v3.2 as system prompt
-       - Current train.py content
-       - Last N experiment results from results.tsv
-       - Available tools: edit_file, run_eval, rent_gpu, stop_gpu, run_remote
-    2. Claude proposes a change to train.py
-    3. Apply the edit to train.py
-    4. Run evaluation against eval_set/:
-       a. Fast scorer (train.py) produces 9-dim trust vector via Hyperbolic inference
-       b. For chains where subtle axes > threshold: invoke judge pipeline (Opus + secondary)
-       c. Compute composite scalar from final trust vector minus FP penalty
-    5. Run gold-set regression check:
-       a. Score all 200 gold-set chains with current train.py
-       b. Compare against human consensus labels per axis
-       c. If any axis degrades: reject change (even if composite improved)
-    6. If improved AND gold-set OK: git commit, append to results.tsv
-       If regressed OR gold-set degraded: git checkout -- train.py
-    7. Log to results.tsv: experiment_id, change_description, per_axis_scores (9 cols),
-       composite, false_positive_rate, judge_agreement, gold_set_agreement,
-       explanation_quality, cost, wall_time
-    8. If 3 consecutive no-improvement: prompt Claude to consider LoRA fine-tune
-    9. Enforce: <=15 min wall time, <=$8 Hyperbolic spend per experiment
-```
+**Unit tests:**
+- `test_composite_metric.py` -- composite formula matches spec.yaml weights, FP penalty works
+- `test_escalation_rules.py` -- judge fallback triggers at spec threshold, not below
+- `test_safety_filter.py` -- rejects operational instructions, allows structural malicious
+- `test_schema_validation.py` -- EmailChain, TrustVector, ExperimentResult round-trip correctly
+- `test_gold_gate.py` -- rejects experiments that degrade any axis vs human labels, accepts genuine improvements
 
-**Tool definitions** (passed to Anthropic tool-use API):
-- `edit_train(new_content: str)` -- replace train.py contents
-- `run_evaluation()` -- execute eval, return 9-dim trust vector + composite + FP rate + judge agreement + gold-set agreement + explanation samples
-- `rent_gpu(gpu_type, hours, name)` -- provision Hyperbolic GPU for training
-- `stop_gpu(instance_id)` -- terminate GPU
-- `run_remote(instance_id, command)` -- execute on rented GPU
-- `get_experiment_history()` -- last N results from results.tsv
+**Contract tests (`test_providers.py`):**
+- Mock/fixture-based tests for each provider interface
+- GeneratorProvider: returns well-formed text, handles batch
+- ScoringProvider: returns parseable scores, handles retry
+- JudgeProvider: returns per-axis scores matching trust_axes list, dual_judge returns agreement
+- TrainingProvider: rent/stop lifecycle, budget guard triggers at limit
 
-### 10. Evaluation Engine (inside `run_loop.py`)
+**Smoke tests (`test_smoke.py`):**
+- Tiny eval set of 10 chains, tiny gold set of 10 chains
+- One full run_loop cycle with a dummy `train.py` that returns fixed scores
+- Verifies the git commit/discard cycle works end-to-end
 
-- Load `eval_set/eval_chains.jsonl` (1000 chains)
-- Load `gold_set/gold_chains.jsonl` (200 chains with human consensus labels)
-- Run each chain through current `train.py`'s `EmailTrustScorer.score_chain()` via Hyperbolic
-- For subtle axes, invoke `judge_rubric.py` when fast scores > escalation threshold
-- Compare predicted trust vectors vs ground truth labels
-- Per-axis metrics: F1 for binary axes (phish), agreement score for continuous axes, precision/recall for authority_impersonation
-- Composite: `(0.22*phish_f1 + 0.18*truth_agreement + 0.13*manipulation + 0.10*deceit_recall + 0.10*vuln_risk + 0.08*toxicity + 0.05*polarization + 0.04*classic + 0.10*authority_impersonation) - 0.15*false_positive_rate`
-- **Gold-set regression check**: per-axis agreement with human consensus. If any axis degrades from previous best, reject the experiment regardless of composite improvement
-- Also compute: judge agreement, false positive rate on known-legitimate chains, explanation quality
-- Return full 9-dim breakdown + composite + FP rate + judge agreement + gold-set agreement per axis
-
-## Key Design Decisions
-
-- **Clear infrastructure boundaries** -- local LLM for synth gen, Hyperbolic for scoring + training, Anthropic for orchestration + judging. No bleed-through
-- **No Claude Agent SDK** -- plain `anthropic` library with tool-use for full control
-- **uv for package management** -- `pyproject.toml` with `uv sync` / `uv run`
-- **Llama-3.1-8B as base** (128k native context) -- eliminates truncation; YaRN available as escape hatch
-- **Thread-aware architecture** -- email embeddings -> attention over thread -> per-axis heads
-- **9-dim trust vector** -- added authority_impersonation (most common spearphishing pattern)
-- **False positive penalty** -- composite metric penalizes over-flagging
-- **Human-annotated gold set** -- 200 chains calibrate Opus judge, serve as regression test. Axes with Kappa < 0.7 require human spot-checking
-- **Hybrid safety policy** -- real brands preserved in eval_set from real corpora, placeholder-only in synthetic generation, no operational phishing instructions anywhere
-- **Dual-judge labeling** -- Opus primary + configurable secondary + disagreement filter
-- **Explanation generator** -- structured "why suspicious" output for usability
-- **Gold-set gating** -- experiments that improve composite but degrade gold-set agreement on any axis are rejected as false improvements
-- **Git as experiment tracker + results.tsv** -- commits for improvements, TSV for full history
-- **Budget enforcement** -- `BudgetGuard` wraps GPU ops; per-experiment time and spend limits
-- **Eval set is sacred** -- generated once, committed to git, never modified by the agent
+**Regression tests (frozen data):**
+- Gold-set agreement checks against committed gold_chains.jsonl
+- False-positive test slice (known-legitimate chains must score below threshold)
+- Explanation format validation (structured output matches expected schema)
 
 ## Execution Order
 
-Build files in dependency order. Note the gold-set annotation is a human-in-the-loop step that blocks the autoresearch loop.
-
-1. Project scaffolding (pyproject.toml, .env.example, .gitignore)
-2. `local_llm.py` (no internal deps, just Ollama wrapper)
-3. `hyperbolic_utils.py` (no internal deps, scoring inference + GPU rental)
-4. `judge_rubric.py` (depends on anthropic, optionally local_llm for secondary)
-5. `annotation_rubric.md` (static text, defines scoring guidelines)
-6. `prepare.py` (depends on local_llm, judge_rubric)
-7. Generate 200 gold-set candidates via `prepare.py --generate-gold 200`
-8. **HUMAN STEP**: annotate gold set (2-3 annotators, compute Kappa, calibrate Opus)
-9. `train.py` skeleton (depends on hyperbolic_utils)
-10. `program.md` v3.2 (static text)
-11. `run_loop.py` with evaluation engine (depends on all above)
-12. Generate seed `eval_set/` via `prepare.py --seed-eval`
-13. Update README.md with v3.2 architecture + quickstart + safety policy
+1. **Scaffold**: pyproject.toml, .env.example, .gitignore, spec.yaml
+2. **Core platform**: config.py, schemas.py, providers.py
+3. **Unit + contract tests** for core platform (TDD: write tests first)
+4. **Fixed data/eval**: data.py, eval.py
+5. **Unit tests** for data/eval (composite metric, escalation, safety filter, gold gate)
+6. **observe.py** (structured logging, run artifacts)
+7. **annotation_rubric.md** (human scoring guidelines)
+8. Generate gold-set candidates: `uv run python -m autotrust.data build-gold`
+9. **HUMAN STEP**: annotate 200 chains, run `calibrate-judge`
+10. **train.py** baseline scorer
+11. **program.md** (tiny, references spec.yaml)
+12. **run_loop.py** (thin orchestration)
+13. **Smoke tests** (10-chain eval, 1 loop cycle)
+14. Generate eval_set: `uv run python -m autotrust.data build-eval`
+15. Update README.md
