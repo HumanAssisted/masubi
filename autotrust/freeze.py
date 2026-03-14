@@ -6,10 +6,8 @@ schema from train.py git history and writes them to the teacher/ directory.
 
 from __future__ import annotations
 
-import ast
 import json
 import re
-import textwrap
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -131,7 +129,6 @@ def extract_label_rules(train_py_source: str) -> dict:
     rules["authority_patterns"] = authority_patterns
 
     # Extract urgency patterns
-    urgency_patterns: list[str] = []
     urgency_match = re.findall(
         r"urgency_patterns\s*=.*?\[.*?\]",
         train_py_source,

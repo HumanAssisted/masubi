@@ -46,3 +46,7 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+
+[tool.ruff.lint.per-file-ignores]
+# load_dotenv() must run before importing modules that read env vars
+"run_loop.py" = ["E402"]

@@ -6,8 +6,6 @@ produces explanation reason tags, and outputs an escalation flag.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,10 +13,6 @@ from torch import Tensor
 
 from autotrust.schemas import MoEConfig, StudentConfig, StudentOutput
 
-if __name__ != "__main__":
-    from typing import TYPE_CHECKING
-    if TYPE_CHECKING:
-        from autotrust.config import Spec
 
 
 class DenseStudent(nn.Module):
@@ -300,7 +294,6 @@ class MoEBlock(nn.Module):
         batch_size, seq_len, hidden_size = x.shape
         # Flatten to (batch * seq_len, hidden_size)
         flat_x = x.view(-1, hidden_size)
-        num_tokens = flat_x.shape[0]
 
         # Compute router logits
         router_logits = self.router(flat_x)  # (num_tokens, num_experts)
@@ -323,8 +316,6 @@ class MoEBlock(nn.Module):
         self, flat_x: Tensor, router_probs: Tensor
     ) -> tuple[Tensor, Tensor]:
         """Standard top-k routing."""
-        num_tokens = flat_x.shape[0]
-
         # Select top-k experts per token
         top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)  # renormalize

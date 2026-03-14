@@ -116,16 +116,16 @@ def test_stall_indicator_shows_count(sample_metrics):
 
 
 def test_enhanced_composite_trend_has_baseline_and_best_so_far(sample_metrics):
-    """Enhanced trend includes baseline hline, best-so-far trace, and improvement rate."""
+    """Enhanced trend includes kept/discarded markers and running best line."""
     from autotrust.dashboard.charts import enhanced_composite_trend
 
     fig = enhanced_composite_trend(sample_metrics)
     assert isinstance(fig, go.Figure)
-    # Should have at least 2 traces: composite line + best-so-far line
+    # Should have at least 2 traces: kept markers + running best line (+ optional discarded)
     assert len(fig.data) >= 2
     trace_names = [t.name for t in fig.data]
-    assert "Composite" in trace_names
-    assert "Best So Far" in trace_names
+    assert "Kept" in trace_names
+    assert "Running Best" in trace_names
 
 
 def test_enhanced_composite_trend_empty():

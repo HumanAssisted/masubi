@@ -84,7 +84,7 @@ def test_timer_updates_charts(sample_metrics):
             # Result should be a tuple with all outputs (no state)
             assert result is not None
             assert isinstance(result, tuple)
-            assert len(result) == 8  # 8 outputs (status, cost, 5 plots, log)
+            assert len(result) == 9  # 9 outputs (status, cost, summary, 5 plots, log)
     finally:
         _run_manager._current_run_id = old_run_id
         _run_manager._status = old_status

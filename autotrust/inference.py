@@ -7,17 +7,15 @@ selectively escalating to cloud judge when the model's escalate flag triggers.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import structlog
 import torch
 
 from autotrust.export import load_pytorch
 from autotrust.schemas import (
-    CheckpointMeta,
     Explanation,
     ScorerOutput,
-    StudentConfig,
     StudentOutput,
 )
 from autotrust.student import predict

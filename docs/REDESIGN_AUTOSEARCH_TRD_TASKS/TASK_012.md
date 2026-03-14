@@ -78,6 +78,17 @@ Not applicable (this task fixes existing tests, does not add new ones).
 - [ ] All new modules importable without errors
 - [ ] spec.yaml is self-consistent
 
+## Review Notes
+- Full test suite: 247 passed, 0 failed (fixed 3 pre-existing failures + 1 new failure)
+- Fixed test_enhanced_composite_trend: trace names "Composite"/"Best So Far" updated to match actual "Kept"/"Running Best"
+- Fixed test_timer_updates_charts: expected 8 outputs updated to 9 (summary_stats was added)
+- Fixed test_student_output_to_scorer_output: trust vector now includes all 10 axes for ScorerOutput validation
+- Fixed test_score_with_fallback_skips_judge: disabled escalate_on_flag in spec to prevent random model escalation
+- Ruff: all checks pass (0 errors). Removed unused imports (ast, textwrap in freeze.py; math, Spec in student.py; Any, CheckpointMeta, StudentConfig in inference.py). Removed unused variables (colors in charts.py, num_tokens x2 in student.py, urgency_patterns in freeze.py). Added E402 suppression for run_loop.py (load_dotenv pattern).
+- DRY: no duplicate spec loading, no duplicate metric computation outside eval.py, no ad-hoc git subprocess calls
+- All new modules importable: DenseStudent, MoEStudent, freeze_teacher, export_pytorch, load_pytorch, LocalInference
+- spec.yaml self-consistent: weights sum to 1.0, stage2 caps verified, production config present
+
 ## Execution
 - **Agent Type**: coding subagent
 - **Wave**: 6 (final -- depends on all previous waves)

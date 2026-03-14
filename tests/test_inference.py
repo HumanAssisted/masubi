@@ -158,7 +158,7 @@ def test_score_with_fallback_escalates(checkpoint_path, spec):
 
 
 def test_score_with_fallback_skips_judge(checkpoint_path, spec):
-    """Does not call judge when no escalation."""
+    """Does not call judge when escalation is disabled in spec."""
     from autotrust.inference import LocalInference
 
     inference = LocalInference(checkpoint_path)
@@ -166,24 +166,43 @@ def test_score_with_fallback_skips_judge(checkpoint_path, spec):
 
     mock_judge = MagicMock()
 
-    output = inference.score_with_fallback(
-        "safe email",
-        axis_names=axis_names,
-        reason_tag_names=["tag1"],
-        judge=mock_judge,
-        spec=spec,
-        force_escalate=False,
-    )
-    assert isinstance(output, ScorerOutput)
-    mock_judge.judge.assert_not_called()
+    # Disable escalation in spec so the model's escalate flag is ignored
+    original_flag = spec.production.escalate_on_flag
+    spec.production.escalate_on_flag = False
+    try:
+        output = inference.score_with_fallback(
+            "safe email",
+            axis_names=axis_names,
+            reason_tag_names=["tag1"],
+            judge=mock_judge,
+            spec=spec,
+            force_escalate=False,
+        )
+        assert isinstance(output, ScorerOutput)
+        mock_judge.judge.assert_not_called()
+    finally:
+        spec.production.escalate_on_flag = original_flag
 
 
 def test_student_output_to_scorer_output():
     """Conversion from StudentOutput to ScorerOutput preserves trust vector."""
     from autotrust.inference import student_output_to_scorer_output
 
+    # Must include all 10 axes to pass ScorerOutput validation when spec is loaded
+    trust_vector = {
+        "phish": 0.9,
+        "truthfulness": 0.5,
+        "verify_by_search": 0.1,
+        "manipulation": 0.3,
+        "deceit": 0.2,
+        "vulnerability_risk": 0.1,
+        "subtle_toxicity": 0.1,
+        "polarization": 0.05,
+        "classic_email_metrics": 0.1,
+        "authority_impersonation": 0.15,
+    }
     student_out = StudentOutput(
-        trust_vector={"phish": 0.9, "manipulation": 0.3},
+        trust_vector=trust_vector,
         reason_tags=["phish_detected"],
         escalate=False,
     )

@@ -80,7 +80,6 @@ def enhanced_composite_trend(metrics: list[dict]) -> go.Figure:
 
     x = list(range(1, len(metrics) + 1))
     y = [m.get("composite", 0.0) for m in metrics]
-    colors = ["green" if _is_kept(m) else "red" for m in metrics]
 
     # Compute best-so-far line
     best_so_far = []
