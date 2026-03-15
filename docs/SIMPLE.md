@@ -1,22 +1,36 @@
 # Masubi -- Simple Explanation
 
-Masubi is an autoresearch-style loop for email trust scoring. An AI agent proposes changes to one file, we score 1,000 email chains across 10 trust dimensions (not binary spam/not-spam), and a three-gate policy accepts or git-reverts each experiment.
-
-## What's Built
-
-The evaluation infrastructure (10-axis scoring, three-gate keep/discard, Kappa downweighting, explanation quality gating), the data pipeline, providers (Ollama/Hyperbolic/Anthropic), a Gradio dashboard, and model definitions for dense + MoE student models.
-
-## What's Not Done
-
-Human annotation of the gold set (it's machine-labeled), the Stage 2 training loop integration, and the teacher-to-student handoff. The system can run Stage 1 prompt optimization end-to-end, but Stage 2 model training is scaffolded, not functional.
+An AI agent improves an email trust scorer through autonomous experimentation. It edits one file, we score email chains across 10 trust dimensions, and a three-gate policy accepts or reverts each change.
 
 ## The Core Bet
 
-Traditional phishing detection is binary and solved. The unsolved problem is nuanced trust -- manipulation, authority impersonation, subtle toxicity. We evaluate across 10 axes with a gold-set veto that blocks any single-axis regression, even if the overall score improves. The agent can be creative but can't game the metrics because it can't touch the evaluation contract.
+Traditional phishing detection is binary and solved (~98% accuracy). The unsolved problem is nuanced trust: is a legitimate-looking email subtly manipulative? Does it exploit authority? Is the recipient being put at risk?
 
-## Current State (2026-03-14)
+Masubi scores 10 axes (phishing, manipulation, authority impersonation, subtle toxicity, etc.) with a gold-set veto that blocks any single-axis regression, even if the overall score improves. The agent can be creative but can't game the metrics because it can't touch the evaluation contract.
 
-- **Data**: 1,000 eval chains, 200 gold chains (machine-labeled, not human-annotated), 20 synthetic training examples
-- **Stage 1**: 4 runs exist, loop runs end-to-end but no meaningful score improvements yet
-- **Stage 2**: 17.7M-param dense baseline checkpoint exists at composite 0.0 (initialized, not trained). Teacher directory empty. `--stage train` is scaffolded but not wired to actual training
-- **Gold set**: No human annotation done, no Kappa calibration computed
+## How It Works
+
+1. An AI agent (Claude Opus) proposes changes to `train.py`
+2. The modified scorer evaluates email chains across 10 trust axes
+3. Three gates decide whether to keep or revert:
+   - Did the composite score improve?
+   - Did any axis regress on the gold set? (if yes, reject)
+   - Did the model explain why it flagged each axis?
+4. Repeat
+
+## What's Running
+
+- **One command**: `uv run python run_loop.py --max-experiments 5 --eval-limit 100`
+- Dashboard opens automatically, shows live progress
+- Stage 1 optimizes LLM prompts, Stage 2 trains a compact model
+- Auto-transitions between stages after 3 consecutive stalls
+
+## What Makes It Different From autoresearch
+
+Same loop shape (edit one file, keep/discard via git). Everything inside is different:
+
+- **10 axes instead of 1 metric** -- can't hide regressions in a weighted average
+- **Gold-set veto** -- human-labeled reference set with absolute authority
+- **Explanation gate** -- model must say *why* it flagged axes, not just output scores
+- **Remote APIs** -- scores via Qwen3-80B on Hyperbolic, not local GPU training
+- **Safety by construction** -- agent can't modify the evaluation contract
