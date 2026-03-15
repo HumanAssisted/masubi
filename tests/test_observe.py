@@ -57,7 +57,9 @@ def test_start_run_writes_status_file(tmp_path, spec):
 
     ctx = start_run(spec, base_dir=tmp_path)
     status_path = ctx.run_dir / "status.json"
+    history_path = ctx.run_dir / "status_history.jsonl"
     assert status_path.exists()
+    assert history_path.exists()
     data = json.loads(status_path.read_text())
     assert data["state"] == "starting"
     assert data["phase"] == "boot"
@@ -121,6 +123,9 @@ def test_update_run_status_clears_stale_error(tmp_path, spec):
     status_data = json.loads((ctx.run_dir / "status.json").read_text())
     assert status_data["phase"] == "scoring"
     assert "error" not in status_data
+
+    history_lines = (ctx.run_dir / "status_history.jsonl").read_text().strip().splitlines()
+    assert len(history_lines) >= 3
 
 
 def test_log_downweight_warning(tmp_path, spec, caplog):

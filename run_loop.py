@@ -857,6 +857,7 @@ def run_autoresearch(
             training_loss = None
             param_count = None
             expert_utilization = None
+            candidate_path: Path | None = None
 
             # Read current files
             program_md = Path("program.md").read_text()
@@ -949,10 +950,60 @@ def run_autoresearch(
                     continue
 
                 if proposed_edit and proposed_edit.strip() != train_py.strip():
+                    candidate_path = _write_run_artifact(
+                        run_ctx,
+                        experiment_num,
+                        "candidate_train.py",
+                        proposed_edit,
+                    )
                     Path("train.py").write_text(proposed_edit)
                     diff_lines = len(proposed_edit.splitlines()) - len(train_py.splitlines())
                     change_desc = f"Agent edit (experiment {experiment_num})"
-                    logger.info("Edit applied", lines_delta=f"{diff_lines:+d}", new_lines=len(proposed_edit.splitlines()))
+                    logger.info(
+                        "Edit applied",
+                        lines_delta=f"{diff_lines:+d}",
+                        new_lines=len(proposed_edit.splitlines()),
+                        candidate_path=str(candidate_path),
+                    )
+                    update_run_status(
+                        run_ctx,
+                        state="running",
+                        phase="validating-train-py",
+                        stage=stage,
+                        experiment_num=experiment_num,
+                        message=f"Validating candidate train.py for experiment {experiment_num}.",
+                    )
+                    validation_error = _validate_stage1_candidate(Path("train.py"), spec)
+                    if validation_error is not None:
+                        candidate_path, error_path = _capture_candidate_failure(
+                            run_ctx,
+                            experiment_num,
+                            proposed_edit,
+                            "validation",
+                            validation_error,
+                        )
+                        logger.error(
+                            "Candidate train.py validation failed",
+                            experiment_num=experiment_num,
+                            candidate_path=str(candidate_path),
+                            error_path=str(error_path),
+                            error=_summarize_error(validation_error),
+                        )
+                        update_run_status(
+                            run_ctx,
+                            state="running",
+                            phase="validating-train-py",
+                            stage=stage,
+                            experiment_num=experiment_num,
+                            message=(
+                                f"Experiment {experiment_num} failed candidate validation. "
+                                f"Saved artifacts in {candidate_path.parent.relative_to(run_ctx.run_dir)}."
+                            ),
+                            error=_summarize_error(validation_error),
+                        )
+                        Path("train.py").write_text(train_py)
+                        consecutive_no_improvement += 1
+                        continue
                 else:
                     change_desc = f"No change proposed (experiment {experiment_num})"
                     logger.info("Agent proposed no change. Skipping scoring.")
@@ -989,28 +1040,60 @@ def run_autoresearch(
                     _check_experiment_timeout(experiment_start, spec)
                 except ExperimentTimeout as exc:
                     logger.warning("Experiment timed out during scoring", experiment=experiment_num, error=str(exc))
+                    error_path = None
+                    if candidate_path is not None:
+                        _candidate_path, error_path = _capture_candidate_failure(
+                            run_ctx,
+                            experiment_num,
+                            proposed_edit,
+                            "scoring_timeout",
+                            traceback.format_exc(),
+                        )
                     update_run_status(
                         run_ctx,
                         state="running",
                         phase="scoring-eval",
                         stage=stage,
                         experiment_num=experiment_num,
-                        message=f"Experiment {experiment_num} timed out during scoring.",
+                        message=(
+                            f"Experiment {experiment_num} timed out during scoring."
+                            + (f" See {error_path.relative_to(run_ctx.run_dir)}." if error_path else "")
+                        ),
                         error=str(exc),
                     )
                     Path("train.py").write_text(train_py)
                     consecutive_no_improvement += 1
                     continue
                 except Exception as exc:
-                    logger.error("Scoring failed", error=str(exc))
+                    scoring_error = traceback.format_exc()
+                    error_path = None
+                    if candidate_path is not None:
+                        candidate_path, error_path = _capture_candidate_failure(
+                            run_ctx,
+                            experiment_num,
+                            proposed_edit,
+                            "scoring",
+                            scoring_error,
+                        )
+                    logger.error(
+                        "Scoring failed",
+                        experiment_num=experiment_num,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        candidate_path=str(candidate_path) if candidate_path else None,
+                        error_path=str(error_path) if error_path else None,
+                    )
                     update_run_status(
                         run_ctx,
                         state="running",
                         phase="scoring-eval",
                         stage=stage,
                         experiment_num=experiment_num,
-                        message=f"Experiment {experiment_num} failed during scoring.",
-                        error=str(exc),
+                        message=(
+                            f"Experiment {experiment_num} failed during scoring."
+                            + (f" See {error_path.relative_to(run_ctx.run_dir)}." if error_path else "")
+                        ),
+                        error=_summarize_error(scoring_error),
                     )
                     Path("train.py").write_text(train_py)
                     consecutive_no_improvement += 1
@@ -1047,15 +1130,35 @@ def run_autoresearch(
                     gold_predictions = [o.trust_vector for o in gold_outputs]
                     experiment_cost += 0.02 * len(gold_predictions)
                 except Exception as exc:
-                    logger.error("Gold-set scoring failed", error=str(exc))
+                    gold_error = traceback.format_exc()
+                    error_path = None
+                    if stage != "train" and candidate_path is not None:
+                        candidate_path, error_path = _capture_candidate_failure(
+                            run_ctx,
+                            experiment_num,
+                            proposed_edit,
+                            "gold_scoring",
+                            gold_error,
+                        )
+                    logger.error(
+                        "Gold-set scoring failed",
+                        experiment_num=experiment_num,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        candidate_path=str(candidate_path) if candidate_path else None,
+                        error_path=str(error_path) if error_path else None,
+                    )
                     update_run_status(
                         run_ctx,
                         state="running",
                         phase="gold-scoring",
                         stage=stage,
                         experiment_num=experiment_num,
-                        message=f"Experiment {experiment_num} failed during gold scoring.",
-                        error=str(exc),
+                        message=(
+                            f"Experiment {experiment_num} failed during gold scoring."
+                            + (f" See {error_path.relative_to(run_ctx.run_dir)}." if error_path else "")
+                        ),
+                        error=_summarize_error(gold_error),
                     )
                     if stage != "train":
                         Path("train.py").write_text(train_py)

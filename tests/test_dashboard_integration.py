@@ -92,7 +92,7 @@ def test_load_results_with_no_data():
 
 
 def test_poll_live_shows_status_message_before_first_metric():
-    """Live tab should show the external run status message before metrics exist."""
+    """Live tab should show recent status-history lines before metrics exist."""
     from dashboard import poll_live, _run_manager, _poll_cache
 
     old_run_id = _run_manager._current_run_id
@@ -104,10 +104,28 @@ def test_poll_live_shows_status_message_before_first_metric():
         with patch.object(type(_run_manager), "_detect_active_run", return_value="test_run"), \
              patch.object(type(_run_manager), "_detect_active_run_with_state", return_value=("test_run", "starting")), \
              patch("dashboard.data_loader.load_latest_metrics", return_value=([], 0)), \
-             patch("dashboard.data_loader.load_run_status", return_value={"message": "Calling agent for experiment 1."}):
+             patch("dashboard.data_loader.load_run_status", return_value={"message": "Calling agent for experiment 1."}), \
+             patch(
+                 "dashboard.data_loader.load_run_status_history",
+                 return_value=[
+                     {
+                         "updated_at": "2026-03-15T01:04:03+00:00",
+                         "phase": "boot",
+                         "message": "Run created. Waiting to load data.",
+                     },
+                     {
+                         "updated_at": "2026-03-15T01:04:57+00:00",
+                         "phase": "calling-agent",
+                         "stage": "prompt",
+                         "experiment_num": 1,
+                         "message": "Calling agent for experiment 1.",
+                     },
+                 ],
+             ):
             result = poll_live()
             assert result[0] == "starting (external)"
             assert "Calling agent for experiment 1." in result[1]
+            assert "boot" in result[5]
             assert "Calling agent for experiment 1." in result[5]
     finally:
         _run_manager._current_run_id = old_run_id

@@ -307,6 +307,33 @@ def test_load_stage1_scorer_class_uses_train_py_working_copy(tmp_path, monkeypat
     assert scorer_cls.SOURCE == "train"
 
 
+def test_validate_stage1_candidate_accepts_baseline(spec, isolated_workspace):
+    """The baseline Stage 1 template should pass the pre-score smoke validation."""
+    from run_loop import _validate_stage1_candidate
+
+    assert _validate_stage1_candidate(Path("train.py"), spec) is None
+
+
+def test_validate_stage1_candidate_rejects_broken_regex(spec, isolated_workspace):
+    """Validation should catch fragile regex edits before live scoring starts."""
+    from run_loop import _validate_stage1_candidate
+
+    Path("train.py").write_text(
+        """from starting_train import EmailTrustScorer as BaseScorer
+import re
+
+class EmailTrustScorer(BaseScorer):
+    def _parse_response(self, raw):
+        raw = re.sub(r"```json|```", "\\1", raw)
+        return super()._parse_response(raw)
+"""
+    )
+
+    error = _validate_stage1_candidate(Path("train.py"), spec)
+    assert error is not None
+    assert "invalid group reference" in error
+
+
 def test_extract_gold_truth_prefers_consensus_labels():
     """Gold truth should come from consensus_labels when present."""
     from run_loop import _gold_truth_labels

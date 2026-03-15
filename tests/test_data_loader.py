@@ -181,6 +181,28 @@ def test_load_run_summary_returns_text(tmp_path):
     assert "Best composite: 0.80" in result
 
 
+def test_load_run_status_history_returns_recent_events(tmp_path):
+    """load_run_status_history returns parsed jsonl events in order."""
+    from autotrust.dashboard.data_loader import load_run_status_history
+
+    run_dir = tmp_path / "run_hist"
+    run_dir.mkdir()
+    history_path = run_dir / "status_history.jsonl"
+    history_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"phase": "boot", "message": "created"}),
+                json.dumps({"phase": "calling-agent", "message": "thinking"}),
+                json.dumps({"phase": "scoring-eval", "message": "scoring"}),
+            ]
+        )
+        + "\n"
+    )
+
+    history = load_run_status_history("run_hist", limit=2, base_dir=tmp_path)
+    assert [event["phase"] for event in history] == ["calling-agent", "scoring-eval"]
+
+
 def test_load_calibration_parses_json(tmp_path):
     """load_calibration returns dict with per_axis_kappa."""
     from autotrust.dashboard.data_loader import load_calibration
