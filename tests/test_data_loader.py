@@ -171,3 +171,24 @@ def test_load_calibration_parses_json(tmp_path):
     result = load_calibration(path=cal_path)
     assert "per_axis_kappa" in result
     assert result["per_axis_kappa"]["phish"] == 0.9
+
+
+def test_format_run_choice_includes_status_and_summary():
+    """format_run_choice returns a readable label plus the original run_id value."""
+    from autotrust.dashboard.data_loader import format_run_choice
+
+    label, value = format_run_choice(
+        {
+            "run_id": "run_001",
+            "status": "running",
+            "experiment_count": 7,
+            "best_composite": 0.7243,
+            "total_cost": 0.21,
+        }
+    )
+
+    assert value == "run_001"
+    assert "running" in label
+    assert "7 exp" in label
+    assert "0.7243" in label
+    assert "$0.21" in label

@@ -24,6 +24,21 @@ def _format_time(wall_time: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def _format_stage2_suffix(result: dict) -> str:
+    """Format optional Stage 2 telemetry fields for compact log lines."""
+    parts = []
+
+    total_loss = result.get("training_loss", {}).get("total_loss")
+    if total_loss is not None:
+        parts.append(f"loss={float(total_loss):.3f}")
+
+    param_count = result.get("param_count")
+    if param_count is not None:
+        parts.append(f"params={float(param_count) / 1e6:.1f}M")
+
+    return "  ".join(parts)
+
+
 def format_experiment_log_entry(
     result: dict,
     prev_composite: float | None,
@@ -53,7 +68,13 @@ def format_experiment_log_entry(
 
     gates_str = _gate_symbols(gate_results)
 
-    return f"[{time_str}] {exp_label}composite={composite:.3f} {delta_str}  {status}  gates: {gates_str}  ${cost:.2f}"
+    stage2_suffix = _format_stage2_suffix(result)
+    suffix = f"  {stage2_suffix}" if stage2_suffix else ""
+
+    return (
+        f"[{time_str}] {exp_label}composite={composite:.3f} {delta_str}  "
+        f"{status}  gates: {gates_str}  ${cost:.2f}{suffix}"
+    )
 
 
 def format_experiment_detail(result: dict, prev_best: dict | None) -> str:

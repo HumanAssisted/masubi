@@ -75,6 +75,25 @@ def list_runs(base_dir: Path = Path("runs")) -> list[dict]:
     return runs
 
 
+def format_run_choice(run: dict) -> tuple[str, str]:
+    """Format a run metadata dict as a human-readable dropdown label."""
+    run_id = run.get("run_id", "unknown")
+    status = run.get("status", "unknown")
+    experiment_count = int(run.get("experiment_count", 0) or 0)
+    best_composite = float(run.get("best_composite", 0.0) or 0.0)
+    total_cost = float(run.get("total_cost", 0.0) or 0.0)
+
+    exp_label = "1 exp" if experiment_count == 1 else f"{experiment_count} exp"
+    parts = [status, run_id, exp_label]
+
+    if experiment_count:
+        parts.append(f"best {best_composite:.4f}")
+    if total_cost:
+        parts.append(f"${total_cost:.2f}")
+
+    return (" | ".join(parts), run_id)
+
+
 def load_run_metrics(run_id: str, base_dir: Path = Path("runs")) -> list[dict]:
     """Load metrics.jsonl for a run as a list of dicts.
 

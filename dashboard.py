@@ -12,6 +12,7 @@ import gradio as gr
 
 from autotrust.dashboard import charts, data_loader, log_formatter
 from autotrust.dashboard.run_manager import RunManager
+from autotrust.dashboard.utils import is_kept as _is_kept
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -86,18 +87,67 @@ def _status_banner(metrics: list[dict]) -> str:
     cost = sum(m.get("cost", 0) for m in metrics)
     latest = metrics[-1]
     latest_status = "KEPT" if _is_kept(latest) else "DISCARDED"
+    stage2_snapshot = _stage2_snapshot(latest)
+    stage2_suffix = f" | {stage2_snapshot}" if stage2_snapshot else ""
 
     return (
         f"**{n}** experiments | **{kept}** kept | "
         f"Best composite: **{best:.4f}** | "
         f"Latest: {latest.get('composite', 0):.4f} ({latest_status}) | "
         f"Cost: **${cost:.2f}** / ${_budget_limit:.2f}"
+        f"{stage2_suffix}"
     )
 
 
-def _is_kept(m: dict) -> bool:
-    gates = m.get("gate_results", {})
-    return bool(gates) and all(gates.values())
+def _stage2_snapshot(result: dict) -> str:
+    """Compact summary of Stage 2 telemetry for banners and summaries."""
+    parts = []
+
+    total_loss = result.get("training_loss", {}).get("total_loss")
+    if total_loss is not None:
+        parts.append(f"Stage 2 loss: **{float(total_loss):.3f}**")
+
+    param_count = result.get("param_count")
+    if param_count is not None:
+        parts.append(f"Params: **{float(param_count) / 1e6:.1f}M**")
+
+    expert_utilization = result.get("expert_utilization", [])
+    if expert_utilization:
+        hottest = max(enumerate(expert_utilization), key=lambda item: item[1])
+        parts.append(f"Top expert: **E{hottest[0]} {hottest[1]:.2f}**")
+
+    return " | ".join(parts)
+
+
+def _run_selector_choices() -> list[tuple[str, str]]:
+    """Build dropdown labels that make live vs historical runs easier to scan."""
+    return [data_loader.format_run_choice(run) for run in data_loader.list_runs()]
+
+
+def _resolve_results_run(run_id: str | None = None) -> tuple[str | None, str, dict | None]:
+    """Resolve which run the Results tab should display and how to label it."""
+    runs = data_loader.list_runs()
+    current_run_id = _run_manager.current_run_id
+    runs_by_id = {run["run_id"]: run for run in runs}
+
+    if run_id:
+        run_info = runs_by_id.get(run_id, {"run_id": run_id, "status": "unknown"})
+        if run_id == current_run_id and run_info.get("status") == "running":
+            return run_id, "selected live run", run_info
+        if run_id == current_run_id:
+            return run_id, "selected current run", run_info
+        return run_id, "selected historical run", run_info
+
+    if current_run_id:
+        run_info = runs_by_id.get(current_run_id, {"run_id": current_run_id, "status": "running"})
+        if run_info.get("status") == "running":
+            return current_run_id, "live run", run_info
+        return current_run_id, "latest run", run_info
+
+    if runs:
+        return runs[0]["run_id"], "latest completed run", runs[0]
+
+    return None, "no run", None
 
 
 # ---------------------------------------------------------------------------
@@ -129,24 +179,26 @@ def poll_live():
 
 def load_results(run_id: str | None = None):
     """Load results for the results tab. Uses current/latest run if none specified."""
-    if not run_id:
-        run_id = _run_manager.current_run_id
-    if not run_id:
-        runs = data_loader.list_runs()
-        if runs:
-            run_id = runs[0]["run_id"]
+    run_id, view_label, run_info = _resolve_results_run(run_id)
     if not run_id:
         empty = charts._empty_figure("No run data yet")
         return empty, empty, empty, empty, [], "No runs found."
 
     metrics = data_loader.load_run_metrics(run_id)
-    if not metrics:
+    if not metrics and run_id == _run_manager.current_run_id:
         # Try poll cache (run might still be in progress)
         metrics = _refresh_poll_cache()
 
     if not metrics:
         empty = charts._empty_figure("No experiment data")
-        return empty, empty, empty, empty, [], f"Run {run_id} has no experiment data yet."
+        return (
+            empty,
+            empty,
+            empty,
+            empty,
+            [],
+            f"### Run: {run_id}\n**Viewing:** {view_label}\n\nNo experiment data yet.",
+        )
 
     return (
         charts.enhanced_composite_trend(metrics),
@@ -154,7 +206,7 @@ def load_results(run_id: str | None = None):
         charts.gate_pass_rate(metrics),
         charts.cost_efficiency(metrics),
         _best_scores_table(metrics),
-        _results_summary(metrics, run_id),
+        _results_summary(metrics, run_id, view_label=view_label, run_info=run_info),
     )
 
 
@@ -178,29 +230,25 @@ def _best_scores_table(metrics: list[dict]) -> list[list]:
     ]
 
 
-def _results_summary(metrics: list[dict], run_id: str) -> str:
-    n = len(metrics)
-    kept = sum(1 for m in metrics if _is_kept(m))
-    composites = [m.get("composite", 0) for m in metrics]
-    baseline = composites[0]
-    best = max(composites)
-    cost = sum(m.get("cost", 0) for m in metrics)
+def _results_summary(
+    metrics: list[dict],
+    run_id: str,
+    *,
+    view_label: str,
+    run_info: dict | None,
+) -> str:
+    lines = [f"### Run: {run_id}", f"**Viewing:** {view_label}"]
 
-    gate_fails: dict[str, int] = {}
-    for m in metrics:
-        for gate, passed in m.get("gate_results", {}).items():
-            if not passed:
-                gate_fails[gate] = gate_fails.get(gate, 0) + 1
+    if run_info is not None:
+        lines.append(f"**Status:** {run_info.get('status', 'unknown')}")
 
-    lines = [
-        f"### Run: {run_id}",
-        f"- **{n}** experiments, **{kept}** kept ({kept/n*100:.0f}% acceptance rate)" if n else "",
-        f"- Baseline composite: **{baseline:.4f}**",
-        f"- Best composite: **{best:.4f}** ({best - baseline:+.4f} improvement)",
-        f"- Total cost: **${cost:.2f}**",
-    ]
-    if gate_fails:
-        lines.append("- Gate failures: " + ", ".join(f"{g}: {c}" for g, c in sorted(gate_fails.items())))
+    summary = charts.summary_stats(metrics)
+    if summary:
+        lines.extend(["", summary])
+
+    stage2_snapshot = _stage2_snapshot(metrics[-1])
+    if stage2_snapshot:
+        lines.extend(["", f"**Latest Stage 2:** {stage2_snapshot}"])
 
     return "\n".join(lines)
 
@@ -253,8 +301,9 @@ def _build_results_tab():
     with gr.Row():
         run_selector = gr.Dropdown(
             label="Select Run",
-            choices=[r["run_id"] for r in data_loader.list_runs()],
+            choices=_run_selector_choices(),
             value=None,
+            info="Leave blank to follow the live or latest run.",
         )
         refresh_btn = gr.Button("Load Results", variant="primary")
 
@@ -300,11 +349,12 @@ def _build_results_tab():
     # Auto-refresh results from live run too
     results_timer = gr.Timer(value=5)
 
-    def auto_refresh():
-        return load_results(None)
+    def auto_refresh(run_id):
+        return load_results(run_id)
 
     results_timer.tick(
         auto_refresh,
+        inputs=[run_selector],
         outputs=[composite_plot, heatmap_plot, gate_rate_plot, cost_plot, scores_table, summary_md],
     )
 
