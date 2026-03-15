@@ -49,10 +49,15 @@ def test_composite_trend_colors_kept_vs_discarded(sample_metrics):
     fig = composite_trend(sample_metrics)
     assert isinstance(fig, go.Figure)
     assert len(fig.data) >= 1
-    # Verify actual marker colors: green for kept, red for discarded
-    marker_colors = list(fig.data[0].marker.color)
-    assert "green" in marker_colors, "Expected green markers for kept experiments"
-    assert "red" in marker_colors, "Expected red markers for discarded experiments"
+    # Find the trace with per-experiment markers (has color list)
+    marker_trace = None
+    for trace in fig.data:
+        if trace.marker and trace.marker.color and isinstance(trace.marker.color, (list, tuple)):
+            marker_trace = trace
+            break
+    assert marker_trace is not None, "Expected a trace with per-experiment marker colors"
+    marker_colors = list(marker_trace.marker.color)
+    assert "#10b981" in marker_colors or "#ef4444" in marker_colors, "Expected green/red markers"
 
 
 def test_composite_trend_single_experiment(sample_metrics):

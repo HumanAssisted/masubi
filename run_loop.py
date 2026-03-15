@@ -12,9 +12,11 @@ the start of a run and is never modified by the loop itself.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -73,7 +75,7 @@ def load_calibration() -> CalibrationReport:
     )
 
 
-def load_eval_chains() -> list[EmailChain]:
+def load_eval_chains(limit: int | None = None) -> list[EmailChain]:
     """Load evaluation chains from eval_set/eval_chains.jsonl."""
     path = Path("eval_set/eval_chains.jsonl")
     if not path.exists():
@@ -84,11 +86,13 @@ def load_eval_chains() -> list[EmailChain]:
     for line in path.read_text().strip().split("\n"):
         if line:
             chains.append(EmailChain.model_validate_json(line))
+            if limit is not None and len(chains) >= limit:
+                break
     return chains
 
 
 def load_gold_chains() -> list[dict[str, float]]:
-    """Load gold set consensus labels from gold_set/gold_chains.jsonl."""
+    """Load raw gold records from gold_set/gold_chains.jsonl."""
     path = Path("gold_set/gold_chains.jsonl")
     if not path.exists():
         logger.warning("No gold chains found at %s", path)
@@ -97,9 +101,57 @@ def load_gold_chains() -> list[dict[str, float]]:
     chains = []
     for line in path.read_text().strip().split("\n"):
         if line:
-            data = json.loads(line)
-            chains.append(data.get("consensus_labels", data))
+            chains.append(json.loads(line))
     return chains
+
+
+def _load_stage1_scorer_class(train_path: Path | None = None):
+    """Load EmailTrustScorer from the mutable train.py working copy."""
+    path = train_path or Path("train.py")
+    if not path.exists():
+        fallback = Path("starting_train.py")
+        if fallback.exists():
+            path = fallback
+        else:
+            raise ImportError("Could not find train.py or starting_train.py")
+
+    module_name = f"masubi_stage1_{path.stem}_{time.time_ns()}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module spec from {path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    scorer_cls = getattr(module, "EmailTrustScorer", None)
+    if scorer_cls is None:
+        raise ImportError(f"{path} does not define EmailTrustScorer")
+    return scorer_cls
+
+
+def _gold_truth_labels(gold_records: list[dict[str, Any]]) -> list[dict[str, float]]:
+    """Extract gold truth labels, preferring consensus labels when present."""
+    return [
+        record.get("consensus_labels", record.get("labels", record))
+        for record in gold_records
+    ]
+
+
+def _gold_chain_models(gold_records: list[dict[str, Any]]) -> list[EmailChain]:
+    """Parse raw gold records into EmailChain objects for scoring."""
+    return [EmailChain.model_validate(record) for record in gold_records]
+
+
+def _chain_text(chain: EmailChain) -> str:
+    """Convert an EmailChain into plain text for student-model scoring."""
+    return "\n".join(
+        f"From: {e.from_addr}\nTo: {e.to_addr}\nSubject: {e.subject}\n{e.body}"
+        for e in chain.emails
+    )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -116,6 +168,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=50,
         help="Maximum number of experiments to run",
+    )
+    parser.add_argument(
+        "--eval-limit",
+        type=int,
+        default=None,
+        help="Optional cap on eval chains to score per experiment (useful for demo runs)",
     )
     return parser.parse_args(argv)
 
@@ -145,10 +203,14 @@ def _auto_transition(spec: Any) -> str:
     2. Archive Stage 1 train.py
     3. Write Stage 2 train.py template
     """
-    from autotrust.freeze import freeze_teacher
+    from autotrust.freeze import freeze_teacher, relabel_training_data
     logger.info("Auto-transitioning to Stage 2: freezing teacher artifacts...")
-    freeze_teacher(spec)
+    artifacts = freeze_teacher(spec)
     logger.info("Teacher artifacts frozen.")
+
+    logger.info("Relabeling training data from frozen teacher...")
+    relabel_training_data(artifacts, spec)
+    logger.info("Training data relabeled.")
 
     logger.info("Archiving Stage 1 train.py...")
     _archive_train_py()
@@ -263,7 +325,7 @@ def _score_with_student_model(
     try:
         from autotrust.inference import LocalInference
         inference = LocalInference(checkpoint_path)
-        reason_tags = [f"{a}_flagged" for a in axis_names]
+        reason_tags = list(axis_names)
         outputs = []
         for text in texts:
             output = inference.score_text(text, axis_names, reason_tags)
@@ -290,77 +352,23 @@ def _archive_train_py() -> None:
 
 def _write_stage2_train_py_template() -> None:
     """Write Stage 2 PyTorch training template for train.py."""
-    template = '''"""Stage 2: Student model training script.
-
-This train.py is automatically generated at the Stage 1 -> Stage 2 transition.
-The agent (Sonnet) will modify this file to optimize the student model.
-
-Usage: uv run python train.py
-Output: saves checkpoint to runs/<run_id>/checkpoints/best.pt
-"""
-
-import json
-import sys
-from pathlib import Path
-
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-
-from autotrust.student import DenseStudent, compute_trust_loss, compute_reason_loss, compute_escalate_loss, compute_total_loss
-from autotrust.export import export_pytorch
-from autotrust.schemas import StudentConfig, CheckpointMeta
-
-
-def load_training_data(synth_dir: Path = Path("synth_data")):
-    """Load soft-labeled training data from synth_data/."""
-    data_path = synth_dir / "train_labeled.jsonl"
-    if not data_path.exists():
-        data_path = synth_dir / "train.jsonl"
-    if not data_path.exists():
-        print("No training data found in synth_data/")
-        sys.exit(1)
-    records = []
-    for line in data_path.read_text().strip().split("\\n"):
-        if line:
-            records.append(json.loads(line))
-    return records
-
-
-def train():
-    """Train the student model."""
-    config = StudentConfig(
-        hidden_size=256,
-        num_layers=6,
-        vocab_size=50000,
-        max_seq_len=512,
-        num_axes=10,
-        num_reason_tags=20,
-    )
-    model = DenseStudent.from_config(config)
-
-    # TODO: Agent will customize this training loop
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-
-    # Save initial checkpoint
-    checkpoint_dir = Path("runs/latest/checkpoints")
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    meta = CheckpointMeta(
-        stage="dense_baseline",
-        experiment_num=0,
-        composite=0.0,
-        path=checkpoint_dir / "best.pt",
-        param_count=model.param_count(),
-    )
-    export_pytorch(model, config, meta, checkpoint_dir / "best.pt")
-    print(f"Checkpoint saved to {checkpoint_dir / 'best.pt'}")
-
-
-if __name__ == "__main__":
-    train()
-'''
-    Path("train.py").write_text(template)
+    template_path = Path(__file__).with_name("starting_train_stage2.py")
+    if not template_path.exists():
+        raise FileNotFoundError(f"Missing Stage 2 template at {template_path}")
+    Path("train.py").write_text(template_path.read_text())
     logger.info("Wrote Stage 2 train.py template")
+
+
+def _load_stage2_training_metrics(checkpoint_path: Path) -> dict[str, Any]:
+    """Load optional training metrics emitted by the Stage 2 trainer."""
+    metrics_path = checkpoint_path.parent / "training_metrics.json"
+    if not metrics_path.exists():
+        return {}
+    try:
+        return json.loads(metrics_path.read_text())
+    except json.JSONDecodeError:
+        logger.warning("Invalid Stage 2 training metrics at %s", metrics_path)
+        return {}
 
 
 def _run_stage2_iteration(
@@ -370,6 +378,7 @@ def _run_stage2_iteration(
     all_results: list[dict],
     consecutive_no_improvement: int,
     experiment_start: float,
+    eval_limit: int | None = None,
 ) -> dict | None:
     """Run a single Stage 2 experiment iteration.
 
@@ -447,7 +456,7 @@ def _run_stage2_iteration(
         return None
 
     # Score eval chains using student model
-    eval_chains = load_eval_chains()
+    eval_chains = load_eval_chains(limit=eval_limit)
     if not eval_chains:
         return None
 
@@ -461,11 +470,17 @@ def _run_stage2_iteration(
         Path("train.py").write_text(train_py)
         return None
 
+    training_metrics = _load_stage2_training_metrics(checkpoint_path)
+
     return {
         "outputs": outputs,
+        "checkpoint_path": checkpoint_path,
         "cost": experiment_cost + 0.02 * len(eval_chains),
         "change_desc": f"Stage 2 model training (experiment {experiment_num})",
         "original_train_py": train_py,
+        "training_loss": training_metrics.get("training_loss"),
+        "param_count": training_metrics.get("param_count"),
+        "expert_utilization": training_metrics.get("expert_utilization"),
     }
 
 
@@ -571,6 +586,7 @@ def _log_iteration(ctx: Any, result: ExperimentResult) -> None:
 def run_autoresearch(
     max_experiments: int = 50,
     stage: str = "prompt",
+    eval_limit: int | None = None,
     stop_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | None = None,
 ) -> None:
@@ -600,7 +616,7 @@ def run_autoresearch(
         logger.info("Copied starting_train.py -> train.py as working copy")
 
     logger.info("Loading eval chains...")
-    eval_chains = load_eval_chains()
+    eval_chains = load_eval_chains(limit=eval_limit)
     logger.info("Loaded eval chains", count=len(eval_chains))
 
     logger.info("Loading gold chains...")
@@ -610,6 +626,7 @@ def run_autoresearch(
     has_baseline = False
     prev_best_composite = 0.0
     prev_best_per_axis: dict[str, float] = {}
+    prev_best_gold_per_axis: dict[str, float] = {}
     consecutive_no_improvement = 0
     total_cost = 0.0
     all_results: list[dict] = []
@@ -640,12 +657,16 @@ def run_autoresearch(
         if stop_check and stop_check():
             logger.info("Stop requested via callback. Ending loop.")
             break
+        stop_requested_during_pause = False
         while pause_check and pause_check():
             time.sleep(1)
             # Re-check stop during pause
             if stop_check and stop_check():
                 logger.info("Stop requested during pause. Ending loop.")
+                stop_requested_during_pause = True
                 break
+        if stop_requested_during_pause:
+            break
 
         if not eval_chains:
             logger.warning("No eval chains available. Stopping.")
@@ -661,6 +682,9 @@ def run_autoresearch(
         )
 
         experiment_start = time.time()
+        training_loss = None
+        param_count = None
+        expert_utilization = None
 
         # Read current files
         program_md = Path("program.md").read_text()
@@ -676,13 +700,18 @@ def run_autoresearch(
                 all_results=all_results,
                 consecutive_no_improvement=consecutive_no_improvement,
                 experiment_start=experiment_start,
+                eval_limit=eval_limit,
             )
             if stage2_result is None:
                 consecutive_no_improvement += 1
                 continue
             outputs = stage2_result["outputs"]
+            checkpoint_path = stage2_result["checkpoint_path"]
             experiment_cost = stage2_result["cost"]
             change_desc = stage2_result["change_desc"]
+            training_loss = stage2_result.get("training_loss")
+            param_count = stage2_result.get("param_count")
+            expert_utilization = stage2_result.get("expert_utilization")
         else:
             # --- Stage 1: Prompt optimization (original code path) ---
             # Build agent prompt
@@ -725,9 +754,9 @@ def run_autoresearch(
             logger.info("Scoring %d eval chains...", len(eval_chains))
             score_start = time.time()
             try:
-                from starting_train import EmailTrustScorer
                 from autotrust.providers import get_provider
 
+                EmailTrustScorer = _load_stage1_scorer_class()
                 scorer_provider = get_provider("scorer", spec)
                 scorer = EmailTrustScorer(provider=scorer_provider, spec=spec)
                 outputs = scorer.score_batch(eval_chains)
@@ -753,6 +782,30 @@ def run_autoresearch(
         ground_truth = [c.labels for c in eval_chains]
         explanations = [o.explanation for o in outputs]
 
+        gold_predictions: list[dict[str, float]] = []
+        gold_truth = _gold_truth_labels(gold_chains)
+        if gold_chains:
+            try:
+                if stage == "train":
+                    gold_models = _gold_chain_models(gold_chains)
+                    gold_texts = [_chain_text(chain) for chain in gold_models]
+                    gold_outputs = _score_with_student_model(
+                        checkpoint_path, gold_texts, [a.name for a in spec.trust_axes]
+                    )
+                    if gold_outputs is None:
+                        raise RuntimeError("Student model gold scoring returned no outputs")
+                else:
+                    gold_outputs = scorer.score_batch(_gold_chain_models(gold_chains))
+
+                gold_predictions = [o.trust_vector for o in gold_outputs]
+                experiment_cost += 0.02 * len(gold_predictions)
+            except Exception as exc:
+                logger.error("Gold-set scoring failed: %s", exc)
+                if stage != "train":
+                    Path("train.py").write_text(train_py)
+                consecutive_no_improvement += 1
+                continue
+
         # Gate 1: Composite score
         per_axis_metrics = score_predictions(predictions, ground_truth, spec)
 
@@ -772,8 +825,9 @@ def run_autoresearch(
 
         # Gate 2: Gold-set veto
         if gold_chains:
+            gold_per_axis_metrics = score_predictions(gold_predictions, gold_truth, spec)
             gold_ok, gold_deltas = gold_regression_gate(
-                predictions, gold_chains, prev_best_per_axis, spec
+                gold_predictions, gold_truth, prev_best_gold_per_axis, spec
             )
             regressed = {k: f"{v:.4f}" for k, v in gold_deltas.items() if v < -1e-9}
             logger.info(
@@ -804,6 +858,8 @@ def run_autoresearch(
         if keep:
             prev_best_composite = composite
             prev_best_per_axis = per_axis_metrics
+            if gold_chains:
+                prev_best_gold_per_axis = gold_per_axis_metrics
             has_baseline = True
             consecutive_no_improvement = 0
         else:
@@ -827,7 +883,10 @@ def run_autoresearch(
             composite=composite,
             fp_rate=fp_rate,
             judge_agreement=0.0,
-            gold_agreement=sum(gold_deltas.values()) / len(gold_deltas) if gold_deltas else 0.0,
+            gold_agreement=(
+                sum(gold_per_axis_metrics.values()) / len(gold_per_axis_metrics)
+                if gold_chains else 0.0
+            ),
             explanation_quality=expl_quality,
             downweighted_axes=calibration.flagged_axes,
             gate_results={
@@ -837,10 +896,13 @@ def run_autoresearch(
             },
             cost=experiment_cost,
             wall_time=elapsed,
+            training_loss=training_loss,
+            param_count=param_count,
+            expert_utilization=expert_utilization,
         )
 
         _log_iteration(run_ctx, result)
-        all_results.append(result.model_dump())
+        all_results.append(result.model_dump(exclude_none=True))
 
         logger.info(
             "Experiment %d complete: composite=%.4f %s [%.1fs, $%.2f total, %.1fm elapsed]",
@@ -860,4 +922,8 @@ def run_autoresearch(
 
 if __name__ == "__main__":
     args = _parse_args()
-    run_autoresearch(max_experiments=args.max_experiments, stage=args.stage)
+    run_autoresearch(
+        max_experiments=args.max_experiments,
+        stage=args.stage,
+        eval_limit=args.eval_limit,
+    )

@@ -270,6 +270,7 @@ class MoEBlock(nn.Module):
         self.top_k = top_k
         self.capacity_factor = capacity_factor
         self.routing_strategy = routing_strategy
+        self.last_expert_utilization: Tensor | None = None
 
         # Router
         self.router = nn.Linear(hidden_size, num_experts, bias=False)
@@ -310,6 +311,7 @@ class MoEBlock(nn.Module):
 
         # Compute routing weights
         router_probs = F.softmax(router_logits, dim=-1)  # (num_tokens, num_experts)
+        self.last_expert_utilization = self._compute_expert_utilization(router_probs)
 
         if self.routing_strategy == "expert_choice":
             output, aux_loss = self._expert_choice_forward(flat_x, router_probs)
@@ -392,6 +394,16 @@ class MoEBlock(nn.Module):
         P = router_probs.mean(dim=0)
 
         return self.num_experts * (f * P).sum()
+
+    def _compute_expert_utilization(self, router_probs: Tensor) -> Tensor:
+        """Estimate per-expert dispatch share from the current router outputs."""
+        top_k_indices = torch.topk(router_probs, self.top_k, dim=-1).indices
+        dispatch_count = torch.zeros(self.num_experts, device=router_probs.device)
+        for k in range(self.top_k):
+            for expert_idx in range(self.num_experts):
+                dispatch_count[expert_idx] += (top_k_indices[:, k] == expert_idx).float().sum()
+        total = dispatch_count.sum().clamp(min=1.0)
+        return dispatch_count / total
 
 
 class TransformerMoELayer(nn.Module):

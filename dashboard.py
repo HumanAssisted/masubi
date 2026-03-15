@@ -1,4 +1,8 @@
-"""Gradio Blocks app entry point for the AutoResearch dashboard."""
+"""Masubi dashboard -- two tabs, focused on what matters.
+
+Tab 1: Live Run  -- monitor the autoresearch loop as it runs
+Tab 2: Results   -- see how performance improved over time
+"""
 
 from __future__ import annotations
 
@@ -6,39 +10,31 @@ from pathlib import Path
 
 import gradio as gr
 
-from autotrust.dashboard import charts, data_loader, git_history, log_formatter
+from autotrust.dashboard import charts, data_loader, log_formatter
 from autotrust.dashboard.run_manager import RunManager
 
 # ---------------------------------------------------------------------------
-# Singleton RunManager
+# Setup
 # ---------------------------------------------------------------------------
 
 _run_manager = RunManager()
 
-# Read budget limit from spec.yaml at startup (Issue 007)
 try:
     import yaml
-
     _spec_data = yaml.safe_load(Path("spec.yaml").read_text())
-    _budget_limit = float(_spec_data.get("limits", {}).get("max_spend_usd", 5.0))
+    _budget_limit = float(_spec_data.get("limits", {}).get("max_spend_usd", 8.0))
 except Exception:
-    _budget_limit = 5.0
-
-
-# ---------------------------------------------------------------------------
-# Shared polling cache (Issue 009: avoid duplicated I/O across tabs)
-# ---------------------------------------------------------------------------
+    _budget_limit = 8.0
 
 _poll_cache: dict = {"line_count": 0, "metrics": [], "run_id": None}
 
 
 def _refresh_poll_cache() -> list[dict]:
-    """Fetch new metrics from disk once, shared by all tabs."""
+    """Fetch new metrics from disk once per poll cycle."""
     run_id = _run_manager.current_run_id
     if not run_id:
         return _poll_cache["metrics"]
     if run_id != _poll_cache["run_id"]:
-        # New run detected -- reset cache
         _poll_cache["run_id"] = run_id
         _poll_cache["line_count"] = 0
         _poll_cache["metrics"] = []
@@ -50,12 +46,119 @@ def _refresh_poll_cache() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Button handlers
 # ---------------------------------------------------------------------------
 
+def handle_start(max_exp):
+    try:
+        _run_manager.start(int(max_exp))
+        return "Running..."
+    except RuntimeError as exc:
+        return f"Error: {exc}"
 
-def _compute_best_scores_table(metrics: list[dict]) -> list[list]:
-    """Compute best per-axis scores vs baseline for the dataframe."""
+
+def handle_stop():
+    _run_manager.stop()
+    return "Stopped"
+
+
+def handle_pause_resume():
+    if _run_manager.status == "paused":
+        _run_manager.resume()
+        return "Running"
+    else:
+        _run_manager.pause()
+        return "Paused"
+
+
+# ---------------------------------------------------------------------------
+# Status banner
+# ---------------------------------------------------------------------------
+
+def _status_banner(metrics: list[dict]) -> str:
+    """One-line status summary shown at top of Live tab."""
+    if not metrics:
+        return "Waiting for first experiment..."
+
+    n = len(metrics)
+    kept = sum(1 for m in metrics if _is_kept(m))
+    best = max(m.get("composite", 0) for m in metrics)
+    cost = sum(m.get("cost", 0) for m in metrics)
+    latest = metrics[-1]
+    latest_status = "KEPT" if _is_kept(latest) else "DISCARDED"
+
+    return (
+        f"**{n}** experiments | **{kept}** kept | "
+        f"Best composite: **{best:.4f}** | "
+        f"Latest: {latest.get('composite', 0):.4f} ({latest_status}) | "
+        f"Cost: **${cost:.2f}** / ${_budget_limit:.2f}"
+    )
+
+
+def _is_kept(m: dict) -> bool:
+    gates = m.get("gate_results", {})
+    return bool(gates) and all(gates.values())
+
+
+# ---------------------------------------------------------------------------
+# Live tab polling
+# ---------------------------------------------------------------------------
+
+def poll_live():
+    """Timer callback -- returns all Live tab outputs."""
+    status = _run_manager.status
+    if status == "error" and _run_manager.last_error:
+        status = f"error: {_run_manager.last_error}"
+
+    metrics = _refresh_poll_cache()
+    banner = _status_banner(metrics)
+
+    return (
+        status,
+        banner,
+        charts.composite_trend(metrics),
+        charts.gate_timeline(metrics),
+        charts.radar_chart(metrics[-1] if metrics else {}),
+        log_formatter.format_log_stream(metrics),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Results tab
+# ---------------------------------------------------------------------------
+
+def load_results(run_id: str | None = None):
+    """Load results for the results tab. Uses current/latest run if none specified."""
+    if not run_id:
+        run_id = _run_manager.current_run_id
+    if not run_id:
+        runs = data_loader.list_runs()
+        if runs:
+            run_id = runs[0]["run_id"]
+    if not run_id:
+        empty = charts._empty_figure("No run data yet")
+        return empty, empty, empty, empty, [], "No runs found."
+
+    metrics = data_loader.load_run_metrics(run_id)
+    if not metrics:
+        # Try poll cache (run might still be in progress)
+        metrics = _refresh_poll_cache()
+
+    if not metrics:
+        empty = charts._empty_figure("No experiment data")
+        return empty, empty, empty, empty, [], f"Run {run_id} has no experiment data yet."
+
+    return (
+        charts.enhanced_composite_trend(metrics),
+        charts.axis_improvement_heatmap(metrics),
+        charts.gate_pass_rate(metrics),
+        charts.cost_efficiency(metrics),
+        _best_scores_table(metrics),
+        _results_summary(metrics, run_id),
+    )
+
+
+def _best_scores_table(metrics: list[dict]) -> list[list]:
     if not metrics:
         return []
     baseline = metrics[0].get("per_axis_scores", {})
@@ -67,583 +170,172 @@ def _compute_best_scores_table(metrics: list[dict]) -> list[list]:
     return [
         [
             axis,
-            round(baseline.get(axis, 0), 4),
-            round(best.get(axis, 0), 4),
-            round(best.get(axis, 0) - baseline.get(axis, 0), 4),
+            f"{baseline.get(axis, 0):.4f}",
+            f"{best.get(axis, 0):.4f}",
+            f"{best.get(axis, 0) - baseline.get(axis, 0):+.4f}",
         ]
         for axis in sorted(best.keys())
     ]
 
 
-# ---------------------------------------------------------------------------
-# Button handlers (exposed for testing)
-# ---------------------------------------------------------------------------
+def _results_summary(metrics: list[dict], run_id: str) -> str:
+    n = len(metrics)
+    kept = sum(1 for m in metrics if _is_kept(m))
+    composites = [m.get("composite", 0) for m in metrics]
+    baseline = composites[0]
+    best = max(composites)
+    cost = sum(m.get("cost", 0) for m in metrics)
 
+    gate_fails: dict[str, int] = {}
+    for m in metrics:
+        for gate, passed in m.get("gate_results", {}).items():
+            if not passed:
+                gate_fails[gate] = gate_fails.get(gate, 0) + 1
 
-def handle_start(max_exp):
-    """Start button handler."""
-    try:
-        _run_manager.start(int(max_exp))
-        return "Starting..."
-    except RuntimeError as exc:
-        return f"Error: {exc}"
-
-
-def handle_stop():
-    """Stop button handler."""
-    _run_manager.stop()
-    return "Stopped"
-
-
-def handle_pause_resume():
-    """Pause/resume toggle handler."""
-    if _run_manager.status == "paused":
-        _run_manager.resume()
-        return "Running"
-    else:
-        _run_manager.pause()
-        return "Paused"
-
-
-def _detect_stage(metrics: list[dict]) -> str:
-    """Detect current stage from metrics data."""
-    if any("training_loss" in m for m in metrics):
-        return "Stage 2: Model Training"
-    return "Stage 1: Prompt Optimization"
-
-
-def poll_update():
-    """Timer callback for polling live run data (uses shared cache)."""
-    status_text = _run_manager.status
-    if _run_manager.status == "error" and _run_manager.last_error:
-        status_text = f"error: {_run_manager.last_error}"
-
-    metrics = _refresh_poll_cache()
-
-    if not metrics:
-        return (
-            status_text,
-            "$0.00",
-            "",
-            charts.composite_trend([]),
-            charts.cost_burn([], budget_limit=_budget_limit),
-            charts.radar_chart({}),
-            charts.gate_timeline([]),
-            charts.stall_indicator([]),
-            "No experiments yet.",
-            "Stage 1: Prompt Optimization",
-            charts.training_loss([]),
-            charts.param_count_timeline([]),
-            charts.expert_utilization([]),
-        )
-
-    total_cost = sum(m.get("cost", 0) for m in metrics)
-    stage_text = _detect_stage(metrics)
-
-    return (
-        status_text,
-        f"${total_cost:.2f}",
-        charts.summary_stats(metrics),
-        charts.composite_trend(metrics),
-        charts.cost_burn(metrics, budget_limit=_budget_limit),
-        charts.radar_chart(metrics[-1]) if metrics else charts.radar_chart({}),
-        charts.gate_timeline(metrics),
-        charts.stall_indicator(metrics),
-        log_formatter.format_log_stream(metrics),
-        stage_text,
-        charts.training_loss(metrics),
-        charts.param_count_timeline(metrics),
-        charts.expert_utilization(metrics),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Code Evolution handlers (exposed for testing)
-# ---------------------------------------------------------------------------
-
-
-def refresh_git_log():
-    """Load git log for train.py."""
-    commits = git_history.get_train_py_log()
-    log_data = [
-        [
-            c["hash"][:7],
-            c["message"],
-            c["date"],
-            f"{c['composite']:.3f}" if c.get("composite") is not None else "",
-        ]
-        for c in commits
+    lines = [
+        f"### Run: {run_id}",
+        f"- **{n}** experiments, **{kept}** kept ({kept/n*100:.0f}% acceptance rate)" if n else "",
+        f"- Baseline composite: **{baseline:.4f}**",
+        f"- Best composite: **{best:.4f}** ({best - baseline:+.4f} improvement)",
+        f"- Total cost: **${cost:.2f}**",
     ]
-    choices = [f"{c['hash'][:7]} - {c['message']}" for c in commits]
-    return log_data, gr.update(choices=choices), gr.update(choices=choices)
+    if gate_fails:
+        lines.append("- Gate failures: " + ", ".join(f"{g}: {c}" for g, c in sorted(gate_fails.items())))
 
-
-def show_diff(commit_a_str, commit_b_str, show_discarded):
-    """Show diff between two commits, optionally including discarded experiment info."""
-    if not commit_a_str or not commit_b_str:
-        return "Select two commits to compare.", ""
-    hash_a = commit_a_str.split(" - ")[0]
-    hash_b = commit_b_str.split(" - ")[0]
-    diff = git_history.get_diff(hash_a, hash_b)
-
-    # Build annotation with composite/gate/kept info from commit log
-    commits = git_history.get_train_py_log()
-    commit_map = {c["hash"][:7]: c for c in commits}
-    annotation_parts = [f"**Comparing {hash_a} -> {hash_b}**"]
-
-    for label, h in [("From", hash_a), ("To", hash_b)]:
-        info = commit_map.get(h)
-        if info:
-            comp = f"composite={info['composite']:.3f}" if info.get("composite") is not None else "composite=N/A"
-            kept = "KEPT" if "keep" in info.get("message", "").lower() else "DISCARDED"
-            annotation_parts.append(f"- **{label}** ({h}): {comp}, {kept}")
-
-    annotation = "\n".join(annotation_parts)
-
-    if show_discarded:
-        run_id = _run_manager.current_run_id
-        if not run_id:
-            # Try the most recent run
-            runs = data_loader.list_runs()
-            if runs:
-                run_id = runs[0]["run_id"]
-        if run_id:
-            discarded = git_history.get_discarded_diffs(run_id)
-            if discarded:
-                annotation += "\n\n### Discarded Experiments\n"
-                for d in discarded:
-                    gates = d.get("gate_results", {})
-                    gate_strs = [
-                        f"{'pass' if v else 'FAIL'}:{k}" for k, v in gates.items()
-                    ]
-                    annotation += (
-                        f"- Exp #{d['experiment']}: "
-                        f"composite={d['composite']:.3f}, "
-                        f"gates: {' '.join(gate_strs)}\n"
-                    )
-                    if d.get("change_description"):
-                        annotation += f"  Description: {d['change_description']}\n"
-
-    return diff, annotation
-
-
-# ---------------------------------------------------------------------------
-# Run History handlers (exposed for testing)
-# ---------------------------------------------------------------------------
-
-
-def refresh_run_list():
-    """Refresh the list of past runs."""
-    runs = data_loader.list_runs()
-    rows = [
-        [
-            r["run_id"],
-            r.get("date", ""),
-            r.get("experiment_count", 0),
-            f"{r.get('best_composite', 0):.4f}",
-            f"${r.get('total_cost', 0):.2f}",
-            r.get("status", "unknown"),
-        ]
-        for r in runs
-    ]
-    choices = [r["run_id"] for r in runs]
-    return rows, gr.update(choices=choices), gr.update(choices=choices), gr.update(choices=choices)
-
-
-def show_run_detail(run_id):
-    """Show detail for a selected run."""
-    if not run_id:
-        return "Select a run.", None
-    summary = data_loader.load_run_summary(run_id)
-    metrics = data_loader.load_run_metrics(run_id)
-    fig = charts.composite_trend(metrics)
-    return summary, fig
-
-
-def compare_runs(run_id_1, run_id_2):
-    """Compare two runs."""
-    if not run_id_1 or not run_id_2:
-        return None
-    m1 = data_loader.load_run_metrics(run_id_1)
-    m2 = data_loader.load_run_metrics(run_id_2)
-    return charts.run_comparison(m1, m2)
-
-
-def export_metrics(run_id):
-    """Export metrics.jsonl for a run."""
-    if not run_id:
-        return None
-    path = Path("runs") / run_id / "metrics.jsonl"
-    return str(path) if path.exists() else None
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Tab builders
 # ---------------------------------------------------------------------------
 
-
-def _build_live_run_tab():
-    """Build the Live Run tab (primary view)."""
-    # Row 0 -- Controls
+def _build_live_tab():
+    """Tab 1: Monitor the running loop."""
+    # Controls
     with gr.Row():
-        start_btn = gr.Button("Start", variant="primary")
-        stop_btn = gr.Button("Stop", variant="stop")
-        pause_btn = gr.Button("Pause/Resume")
-        max_exp_input = gr.Number(value=50, label="Max Experiments", precision=0)
-        status_indicator = gr.Textbox(value="idle", label="Status", interactive=False)
-        cost_display = gr.Textbox(value="$0.00", label="Cost So Far", interactive=False)
-        stage_indicator = gr.Textbox(
-            value="Stage 1: Prompt Optimization",
-            label="Current Stage",
-            interactive=False,
-        )
+        start_btn = gr.Button("Start Run", variant="primary", scale=2)
+        stop_btn = gr.Button("Stop", variant="stop", scale=1)
+        pause_btn = gr.Button("Pause / Resume", scale=1)
+        max_exp_input = gr.Number(value=10, label="Max Experiments", precision=0, scale=1)
+        status_box = gr.Textbox(value="idle", label="Status", interactive=False, scale=1)
 
-    # Row 0.5 -- Summary Stats
-    with gr.Row():
-        summary_md = gr.Markdown(value="")
+    # Status banner
+    banner = gr.Markdown(value="Waiting for first experiment...")
 
-    # Row 1 -- Hero Charts
-    with gr.Row():
-        with gr.Column(scale=3):
-            composite_plot = gr.Plot(label="Composite Score Trend")
-        with gr.Column(scale=1):
-            cost_burn_plot = gr.Plot(label="Cost Burn")
+    # Hero chart: composite trend
+    composite_plot = gr.Plot(label="Composite Score Over Time")
 
-    # Row 2 -- Secondary Charts
+    # Two side-by-side: gates + radar
     with gr.Row():
         with gr.Column():
-            radar_plot = gr.Plot(label="Per-Axis Radar")
+            gate_plot = gr.Plot(label="Gate Results")
         with gr.Column():
-            gate_plot = gr.Plot(label="Gate Timeline")
-        with gr.Column():
-            stall_plot = gr.Plot(label="Stall Indicator")
+            radar_plot = gr.Plot(label="Latest Per-Axis Scores")
 
-    # Row 3 -- Stage 2 Charts (visible when Stage 2 data exists)
-    with gr.Row():
-        with gr.Column():
-            training_loss_plot = gr.Plot(label="Training Loss (Stage 2)")
-        with gr.Column():
-            param_count_plot = gr.Plot(label="Parameter Count (Stage 2)")
-        with gr.Column():
-            expert_util_plot = gr.Plot(label="Expert Utilization (Stage 2)")
-
-    # Row 4 -- Log Stream
-    with gr.Row():
-        log_stream = gr.Markdown(value="No experiments yet.")
+    # Log stream
+    log_stream = gr.Markdown(value="No experiments yet.")
 
     # Wire buttons
-    start_btn.click(handle_start, inputs=[max_exp_input], outputs=[status_indicator])
-    stop_btn.click(handle_stop, outputs=[status_indicator])
-    pause_btn.click(handle_pause_resume, outputs=[status_indicator])
+    start_btn.click(handle_start, inputs=[max_exp_input], outputs=[status_box])
+    stop_btn.click(handle_stop, outputs=[status_box])
+    pause_btn.click(handle_pause_resume, outputs=[status_box])
 
-    # Wire timer for polling (uses shared cache -- no per-tab state)
+    # Poll every 2 seconds
     timer = gr.Timer(value=2)
-
     timer.tick(
-        poll_update,
-        outputs=[
-            status_indicator,
-            cost_display,
-            summary_md,
-            composite_plot,
-            cost_burn_plot,
-            radar_plot,
-            gate_plot,
-            stall_plot,
-            log_stream,
-            stage_indicator,
-            training_loss_plot,
-            param_count_plot,
-            expert_util_plot,
-        ],
+        poll_live,
+        outputs=[status_box, banner, composite_plot, gate_plot, radar_plot, log_stream],
     )
 
 
-def _build_optimization_tab():
-    """Build the Optimization Dashboard tab."""
+def _build_results_tab():
+    """Tab 2: See how performance improved."""
     with gr.Row():
-        opt_composite_plot = gr.Plot(label="Composite Trend (Enhanced)")
+        run_selector = gr.Dropdown(
+            label="Select Run",
+            choices=[r["run_id"] for r in data_loader.list_runs()],
+            value=None,
+        )
+        refresh_btn = gr.Button("Load Results", variant="primary")
+
+    # Summary
+    summary_md = gr.Markdown(value="Select a run and click Load Results.")
+
+    # Hero chart: enhanced composite trend with annotations
+    composite_plot = gr.Plot(label="Autoresearch Progress")
+
+    # Analysis row
     with gr.Row():
         with gr.Column():
-            heatmap_plot = gr.Plot(label="Per-Axis Improvement Heatmap")
+            heatmap_plot = gr.Plot(label="Per-Axis Improvement Over Time")
         with gr.Column():
-            gate_rate_plot = gr.Plot(label="Gate Pass Rate")
+            gate_rate_plot = gr.Plot(label="Gate Pass/Fail Breakdown")
+
+    # Cost + scores
     with gr.Row():
         with gr.Column():
-            cost_eff_plot = gr.Plot(label="Cost Efficiency")
+            cost_plot = gr.Plot(label="Composite Improvement vs Cost")
         with gr.Column():
-            best_scores_table = gr.Dataframe(
+            scores_table = gr.Dataframe(
                 label="Best Scores vs Baseline",
                 headers=["Axis", "Baseline", "Best", "Delta"],
             )
 
-    # Timer for optimization tab updates (uses shared cache -- no per-tab state)
-    opt_timer = gr.Timer(value=3)
+    def on_load(run_id):
+        return load_results(run_id)
 
-    def opt_poll():
-        metrics = _refresh_poll_cache()
-        return (
-            charts.enhanced_composite_trend(metrics),
-            charts.axis_improvement_heatmap(metrics),
-            charts.gate_pass_rate(metrics),
-            charts.cost_efficiency(metrics),
-            _compute_best_scores_table(metrics),
-        )
-
-    opt_timer.tick(
-        opt_poll,
-        outputs=[
-            opt_composite_plot,
-            heatmap_plot,
-            gate_rate_plot,
-            cost_eff_plot,
-            best_scores_table,
-        ],
+    refresh_btn.click(
+        on_load,
+        inputs=[run_selector],
+        outputs=[composite_plot, heatmap_plot, gate_rate_plot, cost_plot, scores_table, summary_md],
     )
 
-
-def _build_code_evolution_tab():
-    """Build the Code Evolution tab (git diff viewer)."""
-    with gr.Row():
-        refresh_btn = gr.Button("Refresh Git Log")
-    with gr.Row():
-        commit_log = gr.Dataframe(
-            headers=["Hash", "Message", "Date", "Composite"],
-            label="train.py Commit History",
-        )
-    with gr.Row():
-        with gr.Column():
-            commit_a = gr.Dropdown(label="Compare From (older)", choices=[])
-            commit_b = gr.Dropdown(label="Compare To (newer)", choices=[])
-            show_discarded = gr.Checkbox(label="Show discarded experiments", value=False)
-            diff_btn = gr.Button("Show Diff")
-        with gr.Column(scale=2):
-            diff_display = gr.Code(label="Diff")
-    with gr.Row():
-        change_annotation = gr.Markdown(value="")
-
-    refresh_btn.click(refresh_git_log, outputs=[commit_log, commit_a, commit_b])
-    diff_btn.click(
-        show_diff,
-        inputs=[commit_a, commit_b, show_discarded],
-        outputs=[diff_display, change_annotation],
+    # Also auto-load on dropdown change
+    run_selector.change(
+        on_load,
+        inputs=[run_selector],
+        outputs=[composite_plot, heatmap_plot, gate_rate_plot, cost_plot, scores_table, summary_md],
     )
 
+    # Auto-refresh results from live run too
+    results_timer = gr.Timer(value=5)
 
-def _build_run_history_tab():
-    """Build the Run History tab."""
-    with gr.Row():
-        refresh_runs_btn = gr.Button("Refresh Run List")
-    with gr.Row():
-        run_list = gr.Dataframe(
-            headers=["Run ID", "Date", "Experiments", "Best Composite", "Total Cost", "Status"],
-            label="Past Runs",
-            interactive=True,
-        )
-    with gr.Row():
-        with gr.Column():
-            selected_run = gr.Dropdown(label="View Run Detail", choices=[])
-            compare_run_1 = gr.Dropdown(label="Compare Run 1", choices=[])
-            compare_run_2 = gr.Dropdown(label="Compare Run 2", choices=[])
-            compare_btn = gr.Button("Compare Runs")
-        with gr.Column(scale=2):
-            run_detail = gr.Markdown(value="Select a run to view details.")
-            run_detail_plot = gr.Plot(label="Run Composite Trend")
-    with gr.Row():
-        comparison_plot = gr.Plot(label="Run Comparison")
-    with gr.Row():
-        export_btn = gr.Button("Export metrics.jsonl")
-        export_file = gr.File(label="Download")
+    def auto_refresh():
+        return load_results(None)
 
-    refresh_runs_btn.click(
-        refresh_run_list,
-        outputs=[run_list, selected_run, compare_run_1, compare_run_2],
-    )
-    selected_run.change(
-        show_run_detail, inputs=[selected_run], outputs=[run_detail, run_detail_plot]
-    )
-    compare_btn.click(
-        compare_runs, inputs=[compare_run_1, compare_run_2], outputs=[comparison_plot]
-    )
-    export_btn.click(export_metrics, inputs=[selected_run], outputs=[export_file])
-
-
-def _build_axes_explorer_tab():
-    """Build the Axes Explorer tab."""
-    with gr.Row():
-        # Get axis names from spec for checkboxes
-        try:
-            from autotrust.config import get_spec
-
-            axis_names = [a.name for a in get_spec().trust_axes]
-        except Exception:
-            axis_names = []
-
-        axis_selector = gr.CheckboxGroup(
-            choices=axis_names,
-            value=axis_names[:3] if len(axis_names) >= 3 else axis_names,
-            label="Select Axes to Plot",
-        )
-        update_trends_btn = gr.Button("Update Trends")
-    with gr.Row():
-        axis_trends_plot = gr.Plot(label="Axis Trends Over Experiments")
-    with gr.Row():
-        with gr.Column():
-            kappa_plot = gr.Plot(label="Per-Axis Kappa (Downweight Visualization)")
-        with gr.Column():
-            correlation_info = gr.Markdown(
-                value="Select axes and run to see correlation data.",
-            )
-
-    def update_axis_trends(selected_axes):
-        run_id = _run_manager.current_run_id
-        if not run_id:
-            runs = data_loader.list_runs()
-            if not runs:
-                return charts.axis_trends([], selected_axes)
-            run_id = runs[0]["run_id"]
-        metrics = data_loader.load_run_metrics(run_id)
-        return charts.axis_trends(metrics, selected_axes)
-
-    def compute_axis_correlation(selected_axes):
-        run_id = _run_manager.current_run_id
-        if not run_id:
-            runs = data_loader.list_runs()
-            if not runs:
-                return "No run data available."
-            run_id = runs[0]["run_id"]
-        metrics = data_loader.load_run_metrics(run_id)
-        if len(metrics) < 3:
-            return "Need at least 3 experiments for correlation."
-        lines = ["### Axis Correlation Summary\n"]
-        for ax1 in selected_axes:
-            for ax2 in selected_axes:
-                if ax1 >= ax2:
-                    continue
-                scores1 = [m.get("per_axis_scores", {}).get(ax1, 0) for m in metrics]
-                scores2 = [m.get("per_axis_scores", {}).get(ax2, 0) for m in metrics]
-                if len(scores1) >= 2:
-                    deltas1 = [b - a for a, b in zip(scores1[:-1], scores1[1:])]
-                    deltas2 = [b - a for a, b in zip(scores2[:-1], scores2[1:])]
-                    same_dir = sum(1 for d1, d2 in zip(deltas1, deltas2) if d1 * d2 > 0)
-                    pct = same_dir / len(deltas1) * 100 if deltas1 else 0
-                    lines.append(f"- **{ax1}** / **{ax2}**: move together {pct:.0f}% of the time")
-        return "\n".join(lines)
-
-    update_trends_btn.click(update_axis_trends, inputs=[axis_selector], outputs=[axis_trends_plot])
-    update_trends_btn.click(
-        compute_axis_correlation, inputs=[axis_selector], outputs=[correlation_info]
-    )
-
-    # Load kappa chart on button click too
-    def load_kappa_chart():
-        calibration = data_loader.load_calibration()
-        return charts.kappa_bars(calibration)
-
-    update_trends_btn.click(load_kappa_chart, outputs=[kappa_plot])
-
-
-def _build_config_tab():
-    """Build the Config tab (read-only reference)."""
-    with gr.Row():
-        refresh_config_btn = gr.Button("Refresh Config")
-    with gr.Row():
-        with gr.Column():
-            spec_display = gr.Code(
-                label="spec.yaml",
-                language="yaml",
-                value=data_loader.load_spec_text(),
-            )
-        with gr.Column():
-            calibration_display = gr.JSON(
-                label="Calibration Report",
-                value=data_loader.load_calibration(),
-            )
-    # Compute initial weights data
-    try:
-        from autotrust.config import get_spec, get_effective_weights
-
-        _init_spec = get_spec()
-        _init_cal = data_loader.load_calibration()
-        _init_kappa = _init_cal.get("per_axis_kappa", {})
-        _init_eff = get_effective_weights(_init_spec, _init_kappa)
-        _init_weights = [
-            [
-                a.name,
-                f"{a.weight:.4f}",
-                f"{_init_eff.get(a.name, a.weight):.4f}",
-                f"{_init_kappa.get(a.name, 1.0):.3f}",
-            ]
-            for a in _init_spec.trust_axes
-        ]
-    except Exception:
-        _init_weights = []
-
-    with gr.Row():
-        weights_table = gr.Dataframe(
-            headers=["Axis", "Original Weight", "Effective Weight", "Kappa"],
-            label="Current Effective Weights",
-            value=_init_weights,
-        )
-
-    def refresh_config():
-        spec_text = data_loader.load_spec_text()
-        calibration = data_loader.load_calibration()
-        try:
-            from autotrust.config import get_spec, get_effective_weights
-
-            spec = get_spec()
-            kappa = calibration.get("per_axis_kappa", {})
-            eff_weights = get_effective_weights(spec, kappa)
-            weights_data = [
-                [
-                    a.name,
-                    f"{a.weight:.4f}",
-                    f"{eff_weights.get(a.name, a.weight):.4f}",
-                    f"{kappa.get(a.name, 1.0):.3f}",
-                ]
-                for a in spec.trust_axes
-            ]
-        except Exception:
-            weights_data = []
-        return spec_text, calibration, weights_data
-
-    refresh_config_btn.click(
-        refresh_config, outputs=[spec_display, calibration_display, weights_table]
+    results_timer.tick(
+        auto_refresh,
+        outputs=[composite_plot, heatmap_plot, gate_rate_plot, cost_plot, scores_table, summary_md],
     )
 
 
 # ---------------------------------------------------------------------------
-# App factory
+# App
 # ---------------------------------------------------------------------------
+
+_THEME = gr.themes.Soft(
+    primary_hue="emerald",
+    secondary_hue="blue",
+    neutral_hue="slate",
+)
 
 
 def create_app() -> gr.Blocks:
-    """Create the Gradio Blocks app with all tabs."""
-    with gr.Blocks(title="AutoResearch Dashboard") as app:
-        gr.Markdown("# AutoResearch Dashboard")
+    with gr.Blocks(title="Masubi") as app:
+        gr.Markdown(
+            "# Masubi\n"
+            "Autonomous email trust research -- 10 axes, three gates, git ratcheting"
+        )
 
         with gr.Tab("Live Run"):
-            _build_live_run_tab()
+            _build_live_tab()
 
-        with gr.Tab("Optimization"):
-            _build_optimization_tab()
-
-        with gr.Tab("Code Evolution"):
-            _build_code_evolution_tab()
-
-        with gr.Tab("Run History"):
-            _build_run_history_tab()
-
-        with gr.Tab("Axes Explorer"):
-            _build_axes_explorer_tab()
-
-        with gr.Tab("Config"):
-            _build_config_tab()
+        with gr.Tab("Results"):
+            _build_results_tab()
 
     return app
 
 
 if __name__ == "__main__":
     app = create_app()
-    app.launch()
+    app.launch(theme=_THEME)

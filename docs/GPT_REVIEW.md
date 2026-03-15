@@ -8,47 +8,45 @@ This file is the deferred review. The immediate execution list is in `docs/10min
 
 ## Bottom Line
 
-Masubi has the right fixed-platform shape, but it is still in a partially transitioned state between a Stage 1 prompt loop and a Stage 2 student-model loop. The project does not need a rewrite. It needs integration cleanup and one unambiguous runnable baseline.
+Masubi has the right fixed-platform shape, and the 2026-03-14 TDD pass moved the repo materially closer to a real runnable baseline. The project still does not need a rewrite. It needs continued integration cleanup and a few final throughput/observability improvements.
 
-## What Changed Since The Earlier Review
+## Status Update After The 10-Minute Build Pass
 
-One earlier critical finding is no longer the live problem:
+Fixed in this pass:
 
-- Stage 1 no longer imports `EmailTrustScorer` from `train.py`.
+- Stage 1 now evaluates the mutable `train.py` working copy.
+- Gold scoring is separate from eval scoring and tracks its own baseline.
+- Stage 2 reason tags now use raw axis names for Gate 3 compatibility.
+- Auto-transition now relabels synth training data before Stage 2.
+- Stage 2 now has a real dense-baseline trainer plus `training_loss` / `param_count` logging.
 
-But the replacement behavior introduced a worse integration bug:
+## Remaining High-Value Work
 
-- Stage 1 now imports `EmailTrustScorer` from `starting_train.py`, so edits to `train.py` are not actually evaluated.
+1. Add a demo-friendly eval limiter and better timing visibility.
 
-That is the current top sanity issue.
+The loop is more correct now than it was, but 1,000-row eval scoring is still a lot for a short demo budget. `--eval-limit` plus timing fields would make the dashboard and live runs much easier to reason about.
 
-## Live Critical Issues
+2. Start logging richer per-experiment artifacts.
 
-1. Stage 1 edits are inert.
+`training_loss` and `param_count` now flow through, but predictions, phase timings, and gold per-axis deltas would make the dashboard much more diagnostic.
 
-`run_loop.py` copies `starting_train.py` into `train.py`, but Stage 1 scoring still imports from `starting_train.py`. The mutable file and the evaluated file are not the same thing.
+3. Keep dense-baseline work ahead of MoE work.
 
-2. The gold gate is still broken on real repo data.
+The dense baseline now exists and trains, so the next ML question is whether it is good enough before any MoE search complexity is added.
 
-The loop feeds 1,000 eval predictions into a 200-row gold set. The committed datasets have zero `chain_id` overlap, so Gate 2 raises on mismatched sample counts.
+4. Continue reducing duplicated sources of truth.
 
-3. Stage 2 explanations do not match Gate 3's contract.
-
-Stage 2 emits `*_flagged` tags while `explanation_quality(...)` expects exact axis names.
-
-4. Stage 2 handoff is incomplete.
-
-Auto-transition freezes artifacts and rewrites `train.py`, but it does not relabel training data. The relabeling helper also still uses `starting_train.py`, not the frozen best teacher.
+The biggest remaining DRY issue is still state-model duplication across docs, templates, and stage-specific behaviors.
 
 ## High-Value Work That Can Wait Until After The Loop Runs
 
-1. Turn Stage 2 into a real dense-baseline trainer.
+1. Strengthen the new dense-baseline trainer.
 
-The current Stage 2 template is a training scaffold that exports an initialized checkpoint. It is good enough for plumbing, not for a meaningful baseline.
+The repo now has a real dense-baseline trainer, but it is intentionally minimal. The next step is improving training quality, not just plumbing.
 
 2. Enforce Stage 2 limits in the live path.
 
-`validate_moe_config(...)` and `check_param_budget(...)` exist, but the main Stage 2 execution path does not use them.
+`check_param_budget(...)` is now exercised by the dense baseline. `validate_moe_config(...)` still needs to be enforced once MoE search is live.
 
 3. Remove the most important duplication.
 
@@ -106,7 +104,7 @@ The dense student is a credible scaffold:
 
 What is still missing:
 
-- a real training loop
+- a stronger training loop
 - real teacher distillation during handoff
 - tokenizer parity between training and local inference
 - calibration and objective shaping beyond the current stub
@@ -138,13 +136,11 @@ The docs still describe a cleaner and more coherent status than the current code
 
 Priority order:
 
-1. Make Stage 1 evaluate the working copy `train.py`.
-2. Score the gold set separately and track a gold-only baseline.
-3. Normalize Stage 2 reason tags to the explanation-gate contract.
-4. Make auto-transition produce labeled teacher data.
-5. Turn Stage 2 into a minimal real dense trainer.
-
-After that, clean up duplication and only then spend time on MoE, GGUF, tokenizer parity, and provider-backed synthetic generation.
+1. Add `--eval-limit` and timing visibility for live demos.
+2. Log predictions and gold per-axis deltas for the dashboard.
+3. Improve the dense baseline before adding MoE search complexity.
+4. Clean up duplicated state descriptions across docs and templates.
+5. Then invest in MoE, GGUF, tokenizer parity, and provider-backed synthetic generation.
 
 ## Local Verification Notes
 
@@ -153,5 +149,5 @@ Verified locally from the current repo state:
 - `eval_set/eval_chains.jsonl` has 1000 rows.
 - `gold_set/gold_chains.jsonl` has 200 rows.
 - The two datasets have zero `chain_id` overlap.
-- Running `gold_regression_gate(...)` against those live files raises `ValueError: Found input variables with inconsistent numbers of samples: [200, 1000]`.
-- A targeted test pass for run-loop, stage-transition, train, freeze, export, inference, and smoke coverage finished with 68 passes and 1 failing callback test (`tests/test_run_loop.py::test_pause_check_callback_blocks`), which is not itself the main end-to-end blocker.
+- The loop now scores the gold set separately instead of feeding eval predictions into the gold gate.
+- A targeted pass covering run-loop, stage-transition, gold-gate, inference, export, observe, charts, dashboard integration, train, and freeze paths finished with 117 passing tests.

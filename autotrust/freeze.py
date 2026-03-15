@@ -6,8 +6,10 @@ schema from starting_train.py git history and writes them to the teacher/ direct
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -41,6 +43,30 @@ def _get_file_at_commit(commit_hash: str, file: str = "train.py") -> str:
     """Get file contents at a specific commit."""
     from autotrust.dashboard.git_history import get_file_at_commit
     return get_file_at_commit(commit_hash, file)
+
+
+def _load_stage1_scorer_class(path: Path | None = None):
+    """Load EmailTrustScorer from the live Stage 1 working copy when available."""
+    scorer_path = path or Path("train.py")
+    if not scorer_path.exists():
+        scorer_path = Path("starting_train.py")
+
+    module_name = f"masubi_freeze_{scorer_path.stem}_{scorer_path.stat().st_mtime_ns}"
+    spec = importlib.util.spec_from_file_location(module_name, scorer_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load EmailTrustScorer from {scorer_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    scorer_cls = getattr(module, "EmailTrustScorer", None)
+    if scorer_cls is None:
+        raise ImportError(f"{scorer_path} does not define EmailTrustScorer")
+    return scorer_cls
 
 
 # ---------------------------------------------------------------------------
@@ -387,10 +413,10 @@ def relabel_training_data(artifacts: TeacherArtifacts, spec: Spec) -> Path:
         )
         return output_path
 
-    # Full relabeling with scoring provider via EmailTrustScorer
+    # Full relabeling with the current/best Stage 1 scorer
     from autotrust.schemas import EmailChain
-    from starting_train import EmailTrustScorer
 
+    EmailTrustScorer = _load_stage1_scorer_class()
     scorer = EmailTrustScorer(provider=scorer_provider, spec=spec)
 
     labeled_records = []

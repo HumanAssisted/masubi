@@ -92,7 +92,7 @@ def start_run(spec: Spec, base_dir: Path | None = None) -> RunContext:
 
 def log_experiment(ctx: RunContext, result: ExperimentResult) -> None:
     """Log an experiment result to metrics.jsonl (append) and store in context."""
-    result_dict = result.model_dump()
+    result_dict = result.model_dump(exclude_none=True)
     ctx.experiments.append(result_dict)
 
     metrics_path = ctx.run_dir / "metrics.jsonl"

@@ -12,11 +12,31 @@ from autotrust.dashboard.utils import is_kept as _is_kept
 # ---------------------------------------------------------------------------
 
 
+_LAYOUT = dict(
+    template="plotly_white",
+    font=dict(family="Inter, system-ui, sans-serif", size=12),
+    margin=dict(l=48, r=24, t=48, b=40),
+    height=340,
+)
+
+
 def _empty_figure(title: str = "") -> go.Figure:
-    """Return an empty figure with optional title."""
+    """Return an empty figure with a friendly empty-state message."""
     fig = go.Figure()
-    if title:
-        fig.update_layout(title=title)
+    fig.add_annotation(
+        text="Waiting for data...",
+        xref="paper", yref="paper", x=0.5, y=0.5,
+        showarrow=False, font=dict(size=16, color="#94a3b8"),
+    )
+    fig.update_layout(title=title, **_LAYOUT)
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    return fig
+
+
+def _styled(fig: go.Figure) -> go.Figure:
+    """Apply consistent styling to a figure."""
+    fig.update_layout(**_LAYOUT)
     return fig
 
 
@@ -37,24 +57,47 @@ def _extract_axis_names(metrics: list[dict]) -> list[str]:
 def composite_trend(metrics: list[dict]) -> go.Figure:
     """Line chart of composite score over experiments with kept/discarded markers."""
     if not metrics:
-        return _empty_figure("Composite Score Trend")
+        return _empty_figure("Composite Score")
 
     x = list(range(1, len(metrics) + 1))
     y = [m.get("composite", 0.0) for m in metrics]
-    colors = ["green" if _is_kept(m) else "red" for m in metrics]
+    colors = ["#10b981" if _is_kept(m) else "#ef4444" for m in metrics]
+    symbols = ["circle" if _is_kept(m) else "x" for m in metrics]
     descs = [m.get("change_description", "") for m in metrics]
 
+    # Best-so-far line
+    best_so_far = []
+    running_best = 0.0
+    for score in y:
+        if score > running_best:
+            running_best = score
+        best_so_far.append(running_best)
+
     fig = go.Figure()
-    # Line trace
+    # Best-so-far area
     fig.add_trace(
         go.Scatter(
-            x=x,
-            y=y,
-            mode="lines+markers",
-            line={"color": "steelblue"},
-            marker={"color": colors, "size": 10},
-            name="Composite",
-            text=descs,
+            x=x, y=best_so_far, mode="lines", fill="tozeroy",
+            line=dict(color="rgba(16,185,129,0.15)", width=0),
+            fillcolor="rgba(16,185,129,0.08)",
+            name="Best So Far", showlegend=False,
+        )
+    )
+    # Best-so-far line
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=best_so_far, mode="lines",
+            line=dict(color="#10b981", width=2, dash="dot"),
+            name="Best So Far",
+        )
+    )
+    # Individual experiments
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=y, mode="markers",
+            marker=dict(color=colors, size=10, symbol=symbols,
+                        line=dict(color="white", width=1)),
+            name="Experiments", text=descs,
             hovertemplate="Exp %{x}: %{y:.4f}<br>%{text}<extra></extra>",
         )
     )
@@ -62,11 +105,11 @@ def composite_trend(metrics: list[dict]) -> go.Figure:
     n_total = len(metrics)
     n_kept = sum(1 for m in metrics if _is_kept(m))
     fig.update_layout(
-        title=f"Composite Score: {n_total} Experiments, {n_kept} Kept",
+        title=f"Composite Score -- {n_total} experiments, {n_kept} kept",
         xaxis_title="Experiment",
-        yaxis_title="Composite Score",
+        yaxis_title="Composite",
     )
-    return fig
+    return _styled(fig)
 
 
 def enhanced_composite_trend(metrics: list[dict]) -> go.Figure:
@@ -179,11 +222,11 @@ def enhanced_composite_trend(metrics: list[dict]) -> go.Figure:
     n_total = len(metrics)
     n_kept = len(kept_x)
     fig.update_layout(
-        title=f"Autoresearch Progress: {n_total} Experiments, {n_kept} Kept Improvements",
+        title=f"Autoresearch Progress -- {n_total} experiments, {n_kept} kept",
         xaxis_title="Experiment",
         yaxis_title="Composite Score",
     )
-    return fig
+    return _styled(fig)
 
 
 def cost_burn(metrics: list[dict], budget_limit: float) -> go.Figure:
@@ -227,11 +270,10 @@ def radar_chart(experiment: dict) -> go.Figure:
     """Per-axis radar/spider chart for a single experiment."""
     per_axis = experiment.get("per_axis_scores", {})
     if not per_axis:
-        return _empty_figure("Per-Axis Radar")
+        return _empty_figure("Per-Axis Scores")
 
     axis_names = sorted(per_axis.keys())
     values = [per_axis[a] for a in axis_names]
-    # Close the polygon
     axis_names_closed = axis_names + [axis_names[0]]
     values_closed = values + [values[0]]
 
@@ -241,25 +283,28 @@ def radar_chart(experiment: dict) -> go.Figure:
             r=values_closed,
             theta=axis_names_closed,
             fill="toself",
+            fillcolor="rgba(16,185,129,0.15)",
+            line=dict(color="#10b981", width=2),
             name="Scores",
         )
     )
     fig.update_layout(
-        title="Per-Axis Radar",
-        polar={"radialaxis": {"range": [0, 1]}},
+        title="Latest Per-Axis Scores",
+        polar=dict(
+            radialaxis=dict(range=[0, 1], tickfont=dict(size=10)),
+            angularaxis=dict(tickfont=dict(size=10)),
+        ),
     )
-    return fig
+    return _styled(fig)
 
 
 def gate_timeline(metrics: list[dict]) -> go.Figure:
-    """Scatter plot showing pass/fail for each gate across experiments."""
+    """Compact gate timeline -- green dot = pass, red X = fail."""
     if not metrics:
-        return _empty_figure("Gate Timeline")
+        return _empty_figure("Gate Results")
 
     fig = go.Figure()
-    gate_names = []
-    if metrics:
-        gate_names = sorted(metrics[0].get("gate_results", {}).keys())
+    gate_names = sorted(metrics[0].get("gate_results", {}).keys()) if metrics else []
 
     for gate_name in gate_names:
         x_pass, y_pass = [], []
@@ -274,34 +319,26 @@ def gate_timeline(metrics: list[dict]) -> go.Figure:
                 y_fail.append(gate_name)
 
         if x_pass:
-            fig.add_trace(
-                go.Scatter(
-                    x=x_pass,
-                    y=y_pass,
-                    mode="markers",
-                    marker={"color": "green", "symbol": "circle", "size": 12},
-                    name=f"{gate_name} pass",
-                    showlegend=False,
-                )
-            )
+            fig.add_trace(go.Scatter(
+                x=x_pass, y=y_pass, mode="markers",
+                marker=dict(color="#10b981", symbol="circle", size=14,
+                            line=dict(color="white", width=1)),
+                name=f"{gate_name} pass", showlegend=False,
+            ))
         if x_fail:
-            fig.add_trace(
-                go.Scatter(
-                    x=x_fail,
-                    y=y_fail,
-                    mode="markers",
-                    marker={"color": "red", "symbol": "x", "size": 12},
-                    name=f"{gate_name} fail",
-                    showlegend=False,
-                )
-            )
+            fig.add_trace(go.Scatter(
+                x=x_fail, y=y_fail, mode="markers",
+                marker=dict(color="#ef4444", symbol="x", size=14,
+                            line=dict(width=2)),
+                name=f"{gate_name} fail", showlegend=False,
+            ))
 
     fig.update_layout(
-        title="Gate Timeline",
+        title="Gate Results Per Experiment",
         xaxis_title="Experiment",
-        yaxis_title="Gate",
+        yaxis=dict(categoryorder="array", categoryarray=list(reversed(gate_names))),
     )
-    return fig
+    return _styled(fig)
 
 
 def stall_indicator(metrics: list[dict]) -> go.Figure:
@@ -378,11 +415,11 @@ def axis_improvement_heatmap(metrics: list[dict]) -> go.Figure:
         )
     )
     fig.update_layout(
-        title="Per-Axis Improvement Heatmap",
+        title="Per-Axis Change Between Experiments",
         xaxis_title="Experiment",
         yaxis_title="Axis",
     )
-    return fig
+    return _styled(fig)
 
 
 def gate_pass_rate(metrics: list[dict]) -> go.Figure:
@@ -403,29 +440,23 @@ def gate_pass_rate(metrics: list[dict]) -> go.Figure:
                     fail_counts[gate] += 1
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Bar(
-            x=gate_names,
-            y=[pass_counts[g] for g in gate_names],
-            name="Pass",
-            marker_color="green",
-        )
-    )
-    fig.add_trace(
-        go.Bar(
-            x=gate_names,
-            y=[fail_counts[g] for g in gate_names],
-            name="Fail",
-            marker_color="red",
-        )
-    )
+    fig.add_trace(go.Bar(
+        x=gate_names,
+        y=[pass_counts[g] for g in gate_names],
+        name="Pass", marker_color="#10b981",
+    ))
+    fig.add_trace(go.Bar(
+        x=gate_names,
+        y=[fail_counts[g] for g in gate_names],
+        name="Fail", marker_color="#ef4444",
+    ))
     fig.update_layout(
-        title="Gate Pass Rate",
+        title="Gate Pass / Fail",
         barmode="stack",
         xaxis_title="Gate",
         yaxis_title="Count",
     )
-    return fig
+    return _styled(fig)
 
 
 def cost_efficiency(metrics: list[dict]) -> go.Figure:
@@ -444,21 +475,19 @@ def cost_efficiency(metrics: list[dict]) -> go.Figure:
         improvements.append(m.get("composite", 0.0) - baseline)
 
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=cumulative_cost,
-            y=improvements,
-            mode="lines+markers",
-            name="Improvement vs Cost",
-            line={"color": "teal"},
-        )
-    )
+    fig.add_trace(go.Scatter(
+        x=cumulative_cost, y=improvements,
+        mode="lines+markers",
+        name="Improvement vs Cost",
+        line=dict(color="#3b82f6", width=2),
+        marker=dict(size=6),
+    ))
     fig.update_layout(
-        title="Cost Efficiency",
+        title="Composite Improvement vs Cost",
         xaxis_title="Cumulative Cost ($)",
         yaxis_title="Composite Improvement",
     )
-    return fig
+    return _styled(fig)
 
 
 def axis_trends(metrics: list[dict], axes: list[str]) -> go.Figure:

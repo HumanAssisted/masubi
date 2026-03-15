@@ -2,6 +2,8 @@
 
 import pytest
 import time
+import json
+import importlib.util
 from pathlib import Path
 from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
@@ -9,7 +11,7 @@ from unittest.mock import patch, MagicMock
 from autotrust.config import load_spec
 from autotrust.schemas import (
     Email, EmailChain, ScorerOutput, Explanation,
-    StudentConfig, CheckpointMeta,
+    StudentConfig, CheckpointMeta, MoEConfig,
 )
 
 
@@ -32,6 +34,13 @@ def test_cli_default_stage():
     assert args.stage == "prompt"
 
 
+def test_cli_eval_limit_argument():
+    """Parsing --eval-limit sets the optional demo cap."""
+    from run_loop import _parse_args
+    args = _parse_args(["--eval-limit", "100"])
+    assert args.eval_limit == 100
+
+
 def test_auto_transition_triggers(spec):
     """After 3 consecutive no-improvement with stage='prompt', triggers transition."""
     from run_loop import _should_auto_transition
@@ -44,11 +53,30 @@ def test_auto_transition_calls_freeze(spec, tmp_path):
     """Auto-transition calls freeze_teacher()."""
     from run_loop import _auto_transition
 
-    with patch("autotrust.freeze.freeze_teacher") as mock_freeze:
+    with patch("autotrust.freeze.freeze_teacher") as mock_freeze, \
+         patch("autotrust.freeze.relabel_training_data"), \
+         patch("run_loop._archive_train_py"), \
+         patch("run_loop._write_stage2_train_py_template"):
         mock_freeze.return_value = MagicMock()
         new_stage = _auto_transition(spec)
         mock_freeze.assert_called_once()
         assert new_stage == "train"
+
+
+def test_auto_transition_relabels_training_data(spec):
+    """Auto-transition should relabel synth training data before Stage 2 starts."""
+    from run_loop import _auto_transition
+
+    artifacts = MagicMock()
+
+    with patch("autotrust.freeze.freeze_teacher", return_value=artifacts) as mock_freeze, \
+         patch("autotrust.freeze.relabel_training_data") as mock_relabel, \
+         patch("run_loop._archive_train_py"), \
+         patch("run_loop._write_stage2_train_py_template"):
+        new_stage = _auto_transition(spec)
+        assert new_stage == "train"
+        mock_freeze.assert_called_once_with(spec)
+        mock_relabel.assert_called_once_with(artifacts, spec)
 
 
 def test_stage2_time_limit(spec):
@@ -144,6 +172,33 @@ def test_stage2_scoring_uses_checkpoint(spec, tmp_path, monkeypatch):
     assert len(outputs) == 1
     from autotrust.schemas import ScorerOutput
     assert isinstance(outputs[0], ScorerOutput)
+
+
+def test_stage2_scoring_uses_axis_names_for_reason_tags(spec, tmp_path, monkeypatch):
+    """Stage 2 should map reason tags to raw axis names for Gate 3 compatibility."""
+    from run_loop import _score_with_student_model
+    import autotrust.inference as inference_mod
+    from autotrust.schemas import ScorerOutput, Explanation
+
+    axis_names = [a.name for a in spec.trust_axes]
+    captured: dict[str, list[str]] = {}
+
+    class DummyInference:
+        def __init__(self, checkpoint_path):
+            self.checkpoint_path = checkpoint_path
+
+        def score_text(self, text, axis_names_arg, reason_tag_names, threshold=0.5):
+            captured["reason_tag_names"] = list(reason_tag_names)
+            return ScorerOutput(
+                trust_vector={a: 0.0 for a in axis_names_arg},
+                explanation=Explanation(reasons=[], summary="dummy"),
+            )
+
+    monkeypatch.setattr(inference_mod, "LocalInference", DummyInference)
+
+    outputs = _score_with_student_model(tmp_path / "best.pt", ["hello"], axis_names)
+    assert outputs is not None
+    assert captured["reason_tag_names"] == axis_names
 
 
 def test_handoff_rewrites_train_py(spec, tmp_path, monkeypatch):
@@ -298,6 +353,56 @@ def test_stage2_iteration_full_pipeline(spec, tmp_path, monkeypatch, sample_chai
         assert "change_desc" in result
 
 
+def test_stage2_iteration_reads_training_metrics(spec, tmp_path, monkeypatch, sample_chains, stage2_checkpoint):
+    """Stage 2 iteration should surface training metrics for dashboard use."""
+    from run_loop import _run_stage2_iteration
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "train.py").write_text("# placeholder train.py")
+
+    metrics_path = stage2_checkpoint.parent / "training_metrics.json"
+    metrics_path.write_text(json.dumps({
+        "training_loss": {
+            "trust_loss": 0.4,
+            "reason_loss": 0.2,
+            "escalate_loss": 0.1,
+            "total_loss": 0.7,
+        },
+        "param_count": 123456,
+        "expert_utilization": [0.2, 0.3, 0.5],
+    }))
+
+    mock_subprocess = MagicMock(returncode=0, stdout="", stderr="")
+    axis_names = [a.name for a in spec.trust_axes]
+    mock_outputs = [
+        ScorerOutput(
+            trust_vector={a: 0.6 for a in axis_names},
+            explanation=Explanation(reasons=["phish"], summary="Test"),
+        )
+        for _ in sample_chains
+    ]
+
+    with patch("run_loop.subprocess.run", return_value=mock_subprocess), \
+         patch("run_loop._call_agent", return_value="# stage 2 modified train.py\nprint('hello')"), \
+         patch("run_loop._find_latest_checkpoint", return_value=stage2_checkpoint), \
+         patch("run_loop.load_eval_chains", return_value=sample_chains), \
+         patch("run_loop._score_with_student_model", return_value=mock_outputs):
+
+        result = _run_stage2_iteration(
+            experiment_num=1,
+            spec=spec,
+            program_md="Stage 2 instructions",
+            all_results=[],
+            consecutive_no_improvement=0,
+            experiment_start=time.time(),
+        )
+
+        assert result is not None
+        assert result["training_loss"]["total_loss"] == 0.7
+        assert result["param_count"] == 123456
+        assert result["expert_utilization"] == [0.2, 0.3, 0.5]
+
+
 def test_stage2_results_flow_through_three_gate_eval(spec, tmp_path, monkeypatch, sample_chains, stage2_checkpoint):
     """Stage 2 results are evaluated through the three-gate pipeline (composite, gold, explanation)."""
     from run_loop import run_autoresearch
@@ -361,9 +466,94 @@ def test_auto_transition_changes_stage_midloop(spec, tmp_path, monkeypatch):
 
     # Verify auto_transition returns "train" and calls freeze
     with patch("autotrust.freeze.freeze_teacher") as mock_freeze, \
+         patch("autotrust.freeze.relabel_training_data"), \
          patch("run_loop._archive_train_py"), \
          patch("run_loop._write_stage2_train_py_template"):
         mock_freeze.return_value = MagicMock()
         new_stage = _auto_transition(spec)
         assert new_stage == "train"
         mock_freeze.assert_called_once_with(spec)
+
+
+def test_generated_stage2_template_trains_and_writes_metrics(tmp_path, monkeypatch):
+    """Generated Stage 2 train.py should train a small model and emit metrics."""
+    from run_loop import _write_stage2_train_py_template
+
+    monkeypatch.chdir(tmp_path)
+    synth_dir = tmp_path / "synth_data"
+    synth_dir.mkdir(parents=True)
+
+    spec = load_spec(Path(__file__).parent.parent / "spec.yaml")
+    axis_names = [a.name for a in spec.trust_axes]
+
+    def make_record(i: int) -> dict:
+        soft_targets = {a: 0.0 for a in axis_names}
+        soft_targets["phish"] = 0.9 if i % 2 == 0 else 0.1
+        soft_targets["manipulation"] = 0.8 if i % 2 == 0 else 0.2
+        return {
+            "chain_id": f"train-{i}",
+            "emails": [
+                {
+                    "from_addr": "sender@example.com",
+                    "to_addr": "recipient@example.com",
+                    "subject": f"Sample {i}",
+                    "body": "Urgent action required" if i % 2 == 0 else "Weekly status update",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "reply_depth": 0,
+                }
+            ],
+            "soft_targets": soft_targets,
+            "labels": soft_targets,
+        }
+
+    records = [make_record(i) for i in range(6)]
+    (synth_dir / "train_labeled.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n"
+    )
+
+    _write_stage2_train_py_template()
+
+    spec_obj = importlib.util.spec_from_file_location("stage2_train_module", tmp_path / "train.py")
+    assert spec_obj is not None and spec_obj.loader is not None
+    module = importlib.util.module_from_spec(spec_obj)
+    spec_obj.loader.exec_module(module)
+    module.train()
+
+    checkpoint_dir = tmp_path / "runs" / "latest" / "checkpoints"
+    assert (checkpoint_dir / "best.pt").exists()
+    metrics = json.loads((checkpoint_dir / "training_metrics.json").read_text())
+    assert metrics["param_count"] > 0
+    assert "training_loss" in metrics
+    assert metrics["training_loss"]["total_loss"] >= 0.0
+
+
+def test_collect_expert_utilization_from_moe_model(spec):
+    """MoE models should expose expert utilization for dashboard logging."""
+    from starting_train_stage2 import collect_expert_utilization
+    from autotrust.student import MoEStudent
+    import torch
+
+    config = StudentConfig(
+        hidden_size=64,
+        num_layers=2,
+        vocab_size=256,
+        max_seq_len=32,
+        num_axes=len(spec.trust_axes),
+        num_reason_tags=len(spec.trust_axes),
+    )
+    moe_config = MoEConfig(
+        num_experts=4,
+        top_k=2,
+        capacity_factor=1.0,
+        moe_layers=[0],
+        routing_strategy="top_k",
+    )
+    model = MoEStudent.from_config(config, moe_config)
+    input_ids = torch.randint(0, config.vocab_size, (2, 16))
+    attention_mask = torch.ones((2, 16), dtype=torch.long)
+    model(input_ids, attention_mask=attention_mask)
+
+    utilization = collect_expert_utilization(model)
+    assert utilization is not None
+    assert len(utilization) == moe_config.num_experts
+    assert abs(sum(utilization) - 1.0) < 1e-5

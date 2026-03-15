@@ -1,257 +1,220 @@
-# Masubi 10-Minute End-to-End Checklist
+# Masubi 10-Minute End-to-End Plan
 
 Date: 2026-03-14
 
-This file is only the "make it run" list. Deferred review notes live in `docs/GPT_REVIEW.md`.
+This is now an execution document, not just a diagnosis list. Deferred architecture and ML review still lives in `docs/GPT_REVIEW.md`.
 
 ## Goal
 
 Get one real end-to-end workflow working:
 
-1. Stage 1 agent edits `train.py`
+1. Stage 1 edits `train.py`
 2. The edited scorer is actually evaluated
-3. All three gates run without crashing
-4. Stage 1 -> Stage 2 handoff produces teacher artifacts and labeled training data
+3. The gold gate runs on the gold set without crashing
+4. Stage 1 -> Stage 2 handoff creates labeled training data
 5. Stage 2 trains a real dense baseline checkpoint
-6. The checkpoint can be exported and scored locally
+6. Stage 2 emits dashboard-friendly metrics
+7. The checkpoint can be exported and scored locally
 
-## Must Do Now
+## TDD Build Order
 
-1. Make Stage 1 score the editable working copy, not the frozen template.
+Build in this order and keep the loop green after each step:
 
-`run_loop.py` copies `starting_train.py` into `train.py`, but the Stage 1 scoring path still imports `EmailTrustScorer` from `starting_train.py` instead of `train.py`. That means the agent can edit `train.py` all day and evaluation never changes.
+1. Add a test that proves Stage 1 loads `EmailTrustScorer` from `train.py`, not `starting_train.py`.
+2. Add a test that gold truth extraction prefers `consensus_labels`.
+3. Add a test that Stage 2 uses raw axis names for reason tags so Gate 3 can pass.
+4. Add a test that auto-transition relabels training data before Stage 2 starts.
+5. Add a test that the generated Stage 2 template really trains and writes `training_metrics.json`.
+6. Add a test that `_run_stage2_iteration(...)` surfaces `training_loss` and `param_count`.
+7. Add a test that `load_eval_chains(limit=N)` honors the demo cap.
+8. Add a test that MoE expert utilization can be collected for dashboard logging.
+9. Run the targeted suite after each change, not only at the end.
 
-Where:
-- `run_loop.py:596-600`
-- `run_loop.py:724-733`
+## Built In This Pass
 
-Fix:
-- Keep `starting_train.py` as the canonical seed.
-- Dynamically load `EmailTrustScorer` from the current `train.py` working copy during Stage 1 scoring.
+### 1. Stage 1 now evaluates the mutable working copy
 
-Done when:
-- A test proves that changing `train.py` changes Stage 1 outputs.
-
-2. Fix the gold gate to score the gold set itself.
-
-The current loop evaluates 1,000 eval-set predictions against 200 gold-set labels. Those datasets are different files with different IDs and zero overlap, so the current gate raises `ValueError: Found input variables with inconsistent numbers of samples: [200, 1000]`.
-
-Where:
-- `run_loop.py:752-777`
-- `autotrust/eval.py:112-141`
-
-Verified on repo data:
-- `eval_set/eval_chains.jsonl`: 1000 rows
-- `gold_set/gold_chains.jsonl`: 200 rows
-- overlap in `chain_id`: 0
-
-Fix:
-- Load full gold chains, not just consensus labels.
-- Score the gold chains separately with the same scorer/checkpoint.
-- Track a separate `prev_best_gold_per_axis` baseline for Gate 2.
-
-Done when:
-- Running the live loop with the committed datasets reaches Gate 2 without crashing.
-
-3. Align Stage 2 reason tags with the explanation gate.
-
-Stage 2 scoring currently emits reason tags like `phish_flagged`, but the explanation gate checks for exact axis names like `phish`. Even good Stage 2 explanations will under-score or fail Gate 3.
+What changed:
+- `run_loop.py` now dynamically loads `EmailTrustScorer` from `train.py`.
+- `starting_train.py` remains the seed template, but it is no longer the file being silently evaluated during Stage 1.
 
 Where:
-- `run_loop.py:263-270`
-- `autotrust/inference.py:102-111`
-- `autotrust/eval.py:164-179`
+- `run_loop.py:106-131`
+- `run_loop.py:742-755`
 
-Fix:
-- Pick one contract and use it everywhere.
-- Fastest path: make Stage 2 emit raw axis names in `reason_tags`.
-- Alternative: normalize `_flagged` suffixes before explanation scoring.
+Why it was useful:
+- this was the highest-value fix
+- without it, the optimization loop was fake
 
-Done when:
-- A student output with flagged `phish` yields explanation quality `1.0` when reasons include `phish`.
+### 2. Gold scoring is now separate from eval scoring
 
-4. Complete the Stage 1 -> Stage 2 handoff.
-
-Auto-transition currently freezes teacher artifacts and rewrites `train.py`, but it does not relabel training data. Also, relabeling still imports `EmailTrustScorer` from `starting_train.py`, so it is not truly tied to the frozen best teacher state.
-
-Where:
-- `run_loop.py:141-160`
-- `autotrust/freeze.py:390-405`
-
-Fix:
-- Call `relabel_training_data(...)` during auto-transition.
-- Make relabeling use the frozen teacher artifacts or the best committed Stage 1 scorer, not the static template.
-
-Done when:
-- Transition produces both `teacher/*` artifacts and `synth_data/train_labeled.jsonl`.
-
-5. Replace the Stage 2 checkpoint stub with a minimal real trainer.
-
-The generated Stage 2 template saves an initialized checkpoint but does not train on data. That is enough for scaffolding, not for a complete workflow.
+What changed:
+- gold records are loaded as raw records
+- the loop extracts truth from `consensus_labels`
+- gold chains are scored separately
+- the loop keeps a separate `prev_best_gold_per_axis` baseline
 
 Where:
-- `run_loop.py` generated Stage 2 template
-- `train.py` after transition
+- `run_loop.py:92-152`
+- `run_loop.py:774-820`
+- `run_loop.py:847-851`
 
-Fix:
-- Load `train_labeled.jsonl` (or explicit soft targets).
-- Train a dense baseline for a small number of steps.
-- Save `runs/latest/checkpoints/best.pt`.
-- Enforce `validate_moe_config(...)` and `check_param_budget(...)` in the live path before any MoE work.
+Why it was useful:
+- this removed the real 1000-vs-200 sample-count crash
+- it also fixed the hidden bookkeeping bug where eval metrics and gold metrics were mixed
 
-Done when:
-- `uv run python train.py` after transition performs actual optimization and writes a trained checkpoint.
+### 3. Stage 2 reason tags now match the explanation gate contract
 
-## Stop Here For Now
-
-Do not spend this pass on:
-
-- GGUF export
-- MoE optimization
-- tokenizer parity
-- generator-provider improvements
-- doc rewrites outside the live workflow
-
-Those are important, but they are not what is currently preventing one complete run from working.
-
-## Useful For A Real 10-Minute Demo
-
-These are useful once the correctness blockers above are fixed.
-
-1. Add an eval limiter for demo runs.
-
-This is the most useful suggestion from the eval note. `run_loop.py` currently loads all rows from `eval_set/eval_chains.jsonl`, and Stage 1 scoring is sequential.
+What changed:
+- Stage 2 now uses raw axis names as reason tags instead of `*_flagged`
 
 Where:
-- `run_loop.py:76-87`
-- `starting_train.py:36-38`
+- `run_loop.py:317-325`
+- `autotrust/inference.py:100-111`
 
-Best quick fix:
-- add `--eval-limit` to `run_loop.py`
-- slice `eval_chains = eval_chains[:eval_limit]`
+Why it was useful:
+- this makes Gate 3 meaningful for Stage 2 instead of structurally unfair
 
-Recommended demo default:
-- `--eval-limit 100`
+### 4. Auto-transition now relabels training data
 
-Why:
-- this is the cheapest way to make one experiment finish inside a short live demo budget
-- it does not solve the correctness bugs, but it does help once those are fixed
-
-2. Parallel scoring is good, but it is not the first 10-minute fix.
-
-Yes, the current scorer is sequential, so batch or parallel provider calls would help. But that is a larger code change than simply limiting eval rows for a demo path.
-
-3. Do not rely on timeout behavior as the "solution."
-
-`per_experiment_timeout_minutes` only prevents runaway experiments. By itself it does not make the loop complete useful work inside 10 minutes.
-
-## Small Additions That Improve The Dashboard Fast
-
-These are worth adding because the dashboard already has places to show them, or they create very obvious next-step visuals.
-
-1. Log Stage 2 training metrics on every experiment.
-
-The dashboard already supports Stage 2 charts for:
-
-- `training_loss`
-- `param_count`
-- `expert_utilization`
+What changed:
+- `_auto_transition(...)` now calls `relabel_training_data(...)`
+- relabeling now loads the live Stage 1 scorer instead of hardcoding `starting_train.py`
 
 Where:
-- `dashboard.py:110-156`
-- `autotrust/dashboard/charts.py:572-676`
+- `run_loop.py:191-214`
+- `autotrust/freeze.py`
 
-Why:
-- this gives immediate observability for whether Stage 2 is actually learning
-- parameter-count-over-time is a very good visual for architecture search
-- expert-utilization heatmaps are the most interesting MoE visualization already supported
+Why it was useful:
+- this made the Stage 1 -> Stage 2 handoff real instead of partial
 
-Minimum useful payload per Stage 2 experiment:
+### 5. Stage 2 has a real dense-baseline trainer now
 
-```json
-{
-  "training_loss": {
-    "trust_loss": 0.42,
-    "reason_loss": 0.19,
-    "escalate_loss": 0.11,
-    "total_loss": 0.72
-  },
-  "param_count": 17677599
-}
-```
-
-If MoE is active, also log:
-
-```json
-{
-  "expert_utilization": [0.22, 0.31, 0.19, 0.28]
-}
-```
-
-2. Log predictions for each experiment, not just aggregate metrics.
-
-`observe.py` already has `log_predictions(...)`, but the main loop is not using it.
+What changed:
+- added `starting_train_stage2.py`
+- the generated Stage 2 `train.py` now trains a compact dense baseline
+- it writes `best.pt` and `training_metrics.json`
 
 Where:
-- `autotrust/observe.py:110-119`
+- `starting_train_stage2.py:1-203`
+- `run_loop.py:345-363`
 
-Why:
-- makes debugging concrete instead of abstract
-- gives us the raw material for future dashboard visuals like score distributions, before/after chain comparisons, and top false positives
-- helps explain why a gate failed
+Why it was useful:
+- this was the best observability/performance tradeoff after the core correctness fixes
+- the dashboard can now show real Stage 2 loss curves and parameter counts
 
-Minimum useful record shape:
+### 6. Stage 2 metrics now flow into run artifacts
 
-```json
-{
-  "chain_id": "eval-000123",
-  "trust_vector": {"phish": 0.91},
-  "reasons": ["phish"],
-  "kept": false
-}
-```
+What changed:
+- `_run_stage2_iteration(...)` reads `training_metrics.json`
+- `ExperimentResult` now has optional Stage 2 fields
+- `observe.log_experiment(...)` omits `None` fields so Stage 1 runs are not mislabeled as Stage 2
 
-3. Add experiment phase timings and sample counts to the logged result.
+Where:
+- `run_loop.py:354-364`
+- `run_loop.py:464-475`
+- `run_loop.py:868-890`
+- `autotrust/schemas.py`
+- `autotrust/observe.py:93-100`
 
-Recommended fields:
+Why it was useful:
+- it lights up dashboard charts that already existed
+- it gives us immediate feedback on whether Stage 2 is actually learning
 
-- `agent_duration_sec`
-- `scoring_duration_sec`
-- `gold_scoring_duration_sec`
-- `train_duration_sec`
-- `eval_count`
-- `gold_count`
+### 7. Demo runs can now cap the eval set
 
-Why:
-- lets the dashboard explain where the 10 minutes are going
-- makes `--eval-limit` effects visible
-- gives a simple path to a later stacked-time or throughput chart
+What changed:
+- added `--eval-limit`
+- `load_eval_chains(limit=...)` now truncates at load time
+- both Stage 1 and Stage 2 use the capped eval set when provided
 
-4. Add gold per-axis results, not only pass/fail.
+Where:
+- `run_loop.py`
 
-Right now the dashboard can show gate failures, but not which axis on the gold set caused the veto.
+Why it was useful:
+- this is the cheapest real throughput improvement for short demo runs
+- it reduces scoring time without changing the full-data default path
 
-Recommended fields:
+### 8. Tests no longer need the live repo `train.py`
 
-- `gold_per_axis_scores`
-- `gold_deltas`
-- `failed_axes`
+What changed:
+- run-loop tests now execute inside temp workspaces with copied templates
+- the test contract is tied to `starting_train.py`, `starting_train_stage2.py`, or temp files, not the mutable repo root `train.py`
 
-Why:
-- turns the gold gate from a black box into a diagnosis tool
-- makes it obvious which axis to optimize next
-- would support a very good heatmap or veto-frequency chart later
+Why it was useful:
+- we can run tests without rewriting the repo's working `train.py`
+- it keeps the research file free to change during real runs
 
-5. For performance, make explanation quality visible during Stage 2 training, not just at final gating.
+### 9. Expert-utilization logging is now real for MoE models
 
-The repo already treats reasons as a real output head. If Stage 2 logs `reason_loss` and explanation quality together, we can tell whether better composite is coming from genuinely better structured reasoning or from gaming the score head.
+What changed:
+- MoE blocks now record last expert-utilization estimates
+- `starting_train_stage2.py` can collect and emit `expert_utilization` when the trained model is MoE
+- `_run_stage2_iteration(...)` already passes that metric through to run artifacts
 
-## Smoke Check After Fixes
+Where:
+- `autotrust/student.py`
+- `starting_train_stage2.py`
+- `run_loop.py`
 
-Run these in order:
+Why it was useful:
+- the dashboard already knows how to render this
+- we do not need full MoE search yet to make the metric path real
+
+## What Proved Most Useful
+
+Highest leverage:
+
+1. Make Stage 1 evaluate `train.py`
+2. Score the gold set separately
+3. Emit Stage 2 `training_loss` and `param_count`
+
+Best dashboard payoff:
+
+1. `training_loss`
+2. `param_count`
+3. `expert_utilization` whenever the Stage 2 model switches to MoE
+
+Best "still worth doing next":
+
+1. Start using `log_predictions(...)`
+2. Add gold per-axis deltas to logged metrics
+3. Add phase timings (`agent_duration_sec`, `scoring_duration_sec`, `train_duration_sec`)
+4. Consider a separate `--gold-limit` only if we explicitly want a relaxed demo mode
+
+## Usefulness And Efficacy Check
+
+What to keep:
+
+- the TDD order above
+- the dense-baseline-first approach
+- Stage 2 metric logging
+
+What not to over-invest in yet:
+
+- parallel scoring before correctness and eval limiting
+- MoE visualization before dense baseline is stable
+- timeout handling as a substitute for throughput
+
+## Verification
+
+Targeted suites used during the build:
 
 ```bash
-uv run pytest tests/test_gold_gate.py tests/test_explanation_gate.py tests/test_stage_transition.py tests/test_inference.py tests/test_export.py
-uv run python run_loop.py --max-experiments 1
-uv run python -m autotrust.export --checkpoint runs/latest/checkpoints/best.pt --format pytorch
+uv run pytest tests/test_run_loop.py -q
+uv run pytest tests/test_stage_transition.py -q
+uv run pytest tests/test_gold_gate.py tests/test_explanation_gate.py tests/test_inference.py tests/test_export.py tests/test_train.py tests/test_freeze.py tests/test_stage_transition.py tests/test_run_loop.py tests/test_observe.py tests/test_charts.py tests/test_dashboard_integration.py -q
 ```
+
+Current result from the broad targeted pass:
+
+- 117 passed
+
+## Next Smallest Steps
+
+If we keep going, do these next:
+
+1. Call `log_predictions(...)` from the main loop.
+2. Add `gold_deltas` and `failed_axes` to `ExperimentResult`.
+3. Add timing fields so the dashboard can explain where the time went.
+4. Decide whether demo mode also needs a separate gold-set cap.

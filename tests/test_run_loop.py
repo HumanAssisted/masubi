@@ -57,7 +57,18 @@ def sample_chains(axis_names):
     ]
 
 
-def test_loop_enforces_time_limit(spec, tmp_path):
+@pytest.fixture
+def isolated_workspace(tmp_path, monkeypatch):
+    """Run loop tests should never touch the repo's live train.py."""
+    monkeypatch.chdir(tmp_path)
+    root = Path(__file__).parent.parent
+    (tmp_path / "starting_train.py").write_text((root / "starting_train.py").read_text())
+    (tmp_path / "program.md").write_text((root / "program.md").read_text())
+    (tmp_path / "train.py").write_text("# test working copy\n")
+    return tmp_path
+
+
+def test_loop_enforces_time_limit(spec, tmp_path, isolated_workspace):
     """Loop exits when wall time exceeds experiment_minutes."""
     from run_loop import run_autoresearch
 
@@ -163,7 +174,7 @@ def test_loop_logs_each_experiment(spec, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_stop_check_callback_exits_loop(spec, tmp_path):
+def test_stop_check_callback_exits_loop(spec, tmp_path, isolated_workspace):
     """Pass a stop_check that returns True after 1 call; verify loop exits early."""
     from run_loop import run_autoresearch
 
@@ -190,7 +201,7 @@ def test_stop_check_callback_exits_loop(spec, tmp_path):
         assert call_count == 1
 
 
-def test_pause_check_callback_blocks(spec, tmp_path):
+def test_pause_check_callback_blocks(spec, tmp_path, isolated_workspace):
     """Pass a pause_check that returns True for 2 calls then False; verify loop pauses then continues."""
     from run_loop import run_autoresearch
 
@@ -258,6 +269,59 @@ def test_check_experiment_timeout_no_raise():
     # 1 minute ago -> should not raise
     experiment_start = time.time() - 1 * 60
     _check_experiment_timeout(experiment_start, mock_spec)  # no exception
+
+
+def test_load_eval_chains_respects_limit(tmp_path, monkeypatch, sample_chains):
+    """load_eval_chains(limit=N) should only load the requested prefix."""
+    from run_loop import load_eval_chains
+
+    monkeypatch.chdir(tmp_path)
+    eval_dir = tmp_path / "eval_set"
+    eval_dir.mkdir()
+    (eval_dir / "eval_chains.jsonl").write_text(
+        "\n".join(chain.model_dump_json() for chain in sample_chains) + "\n"
+    )
+
+    loaded = load_eval_chains(limit=2)
+    assert len(loaded) == 2
+
+
+def test_load_stage1_scorer_class_uses_train_py_working_copy(tmp_path, monkeypatch):
+    """Stage 1 should load EmailTrustScorer from train.py, not starting_train.py."""
+    from run_loop import _load_stage1_scorer_class
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "starting_train.py").write_text(
+        "class EmailTrustScorer:\n"
+        "    SOURCE = 'starting_train'\n"
+    )
+    (tmp_path / "train.py").write_text(
+        "class EmailTrustScorer:\n"
+        "    SOURCE = 'train'\n"
+    )
+
+    scorer_cls = _load_stage1_scorer_class()
+    assert scorer_cls.SOURCE == "train"
+
+
+def test_extract_gold_truth_prefers_consensus_labels():
+    """Gold truth should come from consensus_labels when present."""
+    from run_loop import _gold_truth_labels
+
+    gold_records = [
+        {
+            "chain_id": "gold-1",
+            "labels": {"phish": 0.1},
+            "consensus_labels": {"phish": 0.9},
+        },
+        {
+            "chain_id": "gold-2",
+            "labels": {"phish": 0.2},
+        },
+    ]
+
+    truth = _gold_truth_labels(gold_records)
+    assert truth == [{"phish": 0.9}, {"phish": 0.2}]
 
 
 def test_per_experiment_timeout_in_spec(spec):

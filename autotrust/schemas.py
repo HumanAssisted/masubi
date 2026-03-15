@@ -107,6 +107,9 @@ class ExperimentResult(BaseModel):
     gate_results: dict[str, bool]
     cost: float
     wall_time: float
+    training_loss: dict[str, float] | None = None
+    param_count: int | None = None
+    expert_utilization: list[float] | None = None
 
 
 class RunArtifacts(BaseModel):

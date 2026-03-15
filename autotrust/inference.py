@@ -100,7 +100,7 @@ class LocalInference:
         from autotrust.config import get_spec
         spec = get_spec()
         axis_names = [a.name for a in spec.trust_axes]
-        reason_tag_names = [f"{a}_flagged" for a in axis_names]
+        reason_tag_names = list(axis_names)
 
         # Concatenate emails from chain into text
         text = "\n".join(
