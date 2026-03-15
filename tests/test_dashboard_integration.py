@@ -107,7 +107,7 @@ def test_load_results_with_fixture_data(sample_metrics):
     """load_results returns charts and summary when data exists."""
     from dashboard import load_results
 
-    with patch("dashboard.data_loader.list_runs", return_value=[{"run_id": "test_run"}]), \
+    with patch("dashboard.data_loader.list_runs", return_value=[{"run_id": "test_run", "status": "completed"}]), \
          patch("dashboard.data_loader.load_run_metrics", return_value=sample_metrics):
         result = load_results("test_run")
         assert result is not None
@@ -115,13 +115,42 @@ def test_load_results_with_fixture_data(sample_metrics):
         assert len(result) == 6
         # Last element is the summary markdown
         assert "test_run" in result[-1]
+        assert "Viewing" in result[-1]
+        assert "Status" in result[-1]
 
 
 def test_results_summary_content(sample_metrics):
     """Results summary contains key stats."""
     from dashboard import _results_summary
 
-    summary = _results_summary(sample_metrics, "test_run")
+    summary = _results_summary(
+        sample_metrics,
+        "test_run",
+        view_label="selected historical run",
+        run_info={"status": "completed"},
+    )
     assert "test_run" in summary
     assert "3" in summary  # 3 experiments
     assert "0.724" in summary  # best composite
+    assert "selected historical run" in summary
+
+
+def test_load_results_keeps_selected_historical_run(sample_metrics):
+    """Selecting a past run should not be relabeled as the current live run."""
+    from dashboard import load_results, _run_manager
+
+    old_run_id = _run_manager._current_run_id
+    try:
+        _run_manager._current_run_id = "run_live"
+        with patch(
+            "dashboard.data_loader.list_runs",
+            return_value=[
+                {"run_id": "run_live", "status": "running"},
+                {"run_id": "run_old", "status": "completed"},
+            ],
+        ), patch("dashboard.data_loader.load_run_metrics", return_value=sample_metrics):
+            result = load_results("run_old")
+            assert "run_old" in result[-1]
+            assert "selected historical run" in result[-1]
+    finally:
+        _run_manager._current_run_id = old_run_id

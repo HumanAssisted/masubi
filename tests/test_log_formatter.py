@@ -108,3 +108,18 @@ def test_format_log_stream_newest_first(kept_experiment, discarded_experiment):
     first_690 = next(i for i, ln in enumerate(lines) if "0.690" in ln)
     first_681 = next(i for i, ln in enumerate(lines) if "0.681" in ln)
     assert first_690 < first_681
+
+
+def test_format_log_entry_includes_stage2_metrics(kept_experiment):
+    """Stage 2 log lines include compact loss and param-count telemetry."""
+    from autotrust.dashboard.log_formatter import format_experiment_log_entry
+
+    result = {
+        **kept_experiment,
+        "training_loss": {"total_loss": 0.612},
+        "param_count": 123_000_000,
+    }
+
+    entry = format_experiment_log_entry(result, prev_composite=0.700, experiment_num=4)
+    assert "loss=0.612" in entry
+    assert "params=123.0M" in entry
