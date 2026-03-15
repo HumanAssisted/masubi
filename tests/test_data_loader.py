@@ -75,15 +75,26 @@ def test_list_runs_empty_dir(tmp_path):
 
 
 def test_list_runs_detects_running_status(tmp_path, sample_experiment):
-    """Run with metrics.jsonl but no summary.txt should show status 'running'."""
+    """Run with status.json and no summary.txt should show status 'running'."""
     from autotrust.dashboard.data_loader import list_runs
 
-    # Create run with only metrics.jsonl (no summary.txt)
-    _create_run_dir(tmp_path, "run_active", [sample_experiment])
+    run_dir = _create_run_dir(tmp_path, "run_active", [sample_experiment])
+    (run_dir / "status.json").write_text(json.dumps({"state": "running", "message": "Scoring eval chains."}))
 
     runs = list_runs(base_dir=tmp_path)
     assert len(runs) == 1
     assert runs[0]["status"] == "running"
+
+
+def test_list_runs_marks_orphaned_metrics_as_interrupted(tmp_path, sample_experiment):
+    """Old runs with metrics but no summary or heartbeat should not look live."""
+    from autotrust.dashboard.data_loader import list_runs
+
+    _create_run_dir(tmp_path, "run_orphaned", [sample_experiment])
+
+    runs = list_runs(base_dir=tmp_path)
+    assert len(runs) == 1
+    assert runs[0]["status"] == "interrupted"
 
 
 def test_list_runs_detects_starting_status_from_config_only(tmp_path):

@@ -78,6 +78,7 @@ def test_loop_enforces_time_limit(spec, tmp_path, isolated_workspace):
          patch("run_loop.load_eval_chains", return_value=[]), \
          patch("run_loop.load_gold_chains", return_value=[]), \
          patch("run_loop.finalize_run"), \
+         patch("run_loop.update_run_status"), \
          patch("run_loop.time") as mock_time:
 
         mock_cal.return_value = MagicMock()

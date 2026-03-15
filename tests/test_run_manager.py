@@ -23,8 +23,10 @@ def test_initial_status_is_idle():
     from autotrust.dashboard.run_manager import RunManager
 
     rm = RunManager()
-    assert rm.status == "idle"
-    assert rm.current_run_id is None
+    with patch.object(RunManager, "_detect_active_run_with_state", return_value=(None, "idle")), \
+         patch.object(RunManager, "_detect_active_run", return_value=None):
+        assert rm.status == "idle"
+        assert rm.current_run_id is None
 
 
 def test_external_starting_run_is_detected(tmp_path):
@@ -60,7 +62,9 @@ def test_stop_sets_stopping_then_idle():
     from autotrust.dashboard.run_manager import RunManager
 
     rm = RunManager()
-    with patch("run_loop.run_autoresearch", side_effect=_mock_run_autoresearch):
+    with patch.object(RunManager, "_detect_active_run_with_state", return_value=(None, "idle")), \
+         patch.object(RunManager, "_detect_active_run", return_value=None), \
+         patch("run_loop.run_autoresearch", side_effect=_mock_run_autoresearch):
         rm.start(max_experiments=1000)
         time.sleep(0.05)
         rm.stop()

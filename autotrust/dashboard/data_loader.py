@@ -71,7 +71,6 @@ def list_runs(base_dir: Path = Path("runs")) -> list[dict]:
 
         # Parse summary.txt for date and status
         summary_path = entry / "summary.txt"
-        config_path = entry / "config.json"
         if summary_path.exists():
             for line in summary_path.read_text().strip().split("\n"):
                 if line.startswith("Start time:"):
@@ -82,9 +81,7 @@ def list_runs(base_dir: Path = Path("runs")) -> list[dict]:
         elif status.get("state"):
             info["status"] = status["state"]
         elif metrics_path.exists():
-            info["status"] = "running"
-        elif config_path.exists():
-            info["status"] = "starting"
+            info["status"] = "interrupted"
 
         if status.get("message"):
             info["status_message"] = status["message"]

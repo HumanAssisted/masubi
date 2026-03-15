@@ -119,10 +119,11 @@ def _resolve_results_run(run_id: str | None = None) -> tuple[str | None, str, di
     runs = data_loader.list_runs()
     current_run_id = _run_manager.current_run_id
     runs_by_id = {run["run_id"]: run for run in runs}
+    live_statuses = {"starting", "running", "paused", "stopping", "finalizing"}
 
     if run_id:
         run_info = runs_by_id.get(run_id, {"run_id": run_id, "status": "unknown"})
-        if run_id == current_run_id and run_info.get("status") == "running":
+        if run_id == current_run_id and run_info.get("status") in live_statuses:
             return run_id, "selected live run", run_info
         if run_id == current_run_id:
             return run_id, "selected current run", run_info
@@ -130,7 +131,7 @@ def _resolve_results_run(run_id: str | None = None) -> tuple[str | None, str, di
 
     if current_run_id:
         run_info = runs_by_id.get(current_run_id, {"run_id": current_run_id, "status": "running"})
-        if run_info.get("status") == "running":
+        if run_info.get("status") in live_statuses:
             return current_run_id, "live run", run_info
         return current_run_id, "latest run", run_info
 

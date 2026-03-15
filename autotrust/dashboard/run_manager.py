@@ -131,9 +131,7 @@ class RunManager:
 
         Detection priority:
         1. Explicit running-style states from status.json
-        2. config.json but no summary.txt
-        3. metrics.jsonl but no summary.txt
-        4. metrics.jsonl and summary.txt
+        2. metrics.jsonl and summary.txt
         """
         if not base_dir.exists():
             return None, "idle"
@@ -144,20 +142,15 @@ class RunManager:
         for entry in base_dir.iterdir():
             if not entry.is_dir() or entry.name == "latest":
                 continue
-            has_config = (entry / "config.json").exists()
             has_metrics = (entry / "metrics.jsonl").exists()
             has_summary = (entry / "summary.txt").exists()
             state = cls._load_run_status(entry).get("state")
 
-            if not has_summary and state in {"starting", "running", "paused", "stopping"}:
+            if not has_summary and state in {"starting", "running", "paused", "stopping", "finalizing"}:
                 if state == "starting":
                     starting.append((entry.name, state))
                 else:
                     active.append((entry.name, state))
-            elif has_config and not has_metrics and not has_summary:
-                starting.append((entry.name, "starting"))
-            elif has_metrics and not has_summary:
-                active.append((entry.name, "running"))
             elif has_metrics and has_summary:
                 completed.append((entry.name, "completed"))
 
