@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_ACTIVE_STATES = {"starting", "running", "paused", "stopping", "finalizing"}
+_STALE_STATUS_SECONDS = 15 * 60
 
 
 class RunManager:
@@ -125,6 +129,21 @@ class RunManager:
         except json.JSONDecodeError:
             return {}
 
+    @staticmethod
+    def _status_is_fresh(status: dict, max_age_seconds: int = _STALE_STATUS_SECONDS) -> bool:
+        """Return True when the status heartbeat is recent enough to be considered live."""
+        updated_at = status.get("updated_at")
+        if not updated_at:
+            return True
+        try:
+            updated = datetime.fromisoformat(updated_at)
+        except ValueError:
+            return False
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - updated).total_seconds()
+        return age <= max_age_seconds
+
     @classmethod
     def _detect_active_run_with_state(cls, base_dir: Path = Path("runs")) -> tuple[str | None, str]:
         """Find the most recent in-progress or completed run plus its state.
@@ -144,9 +163,10 @@ class RunManager:
                 continue
             has_metrics = (entry / "metrics.jsonl").exists()
             has_summary = (entry / "summary.txt").exists()
-            state = cls._load_run_status(entry).get("state")
+            status = cls._load_run_status(entry)
+            state = status.get("state")
 
-            if not has_summary and state in {"starting", "running", "paused", "stopping", "finalizing"}:
+            if not has_summary and state in _ACTIVE_STATES and cls._status_is_fresh(status):
                 if state == "starting":
                     starting.append((entry.name, state))
                 else:

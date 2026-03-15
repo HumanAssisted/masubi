@@ -1,411 +1,185 @@
-"""Stage 2 improved trainer for a compact local student model.
+"""Baseline EmailTrustScorer -- the ONLY file the research agent may edit.
 
-Improvements over baseline:
-1. Use ALL training data (not just first 128 records)
-2. Larger model: hidden_size=128, num_layers=4 for better capacity
-3. More epochs (10) with learning rate scheduling (cosine annealing)
-4. Gradient clipping for stability
-5. Per-axis loss weighting to focus on harder/more important axes
-6. Longer sequence length (512) to capture more email content
-7. Validation-based early stopping / best checkpoint selection
-8. Better tokenization with bigram hashing for richer features
+Produces structured ScorerOutput with trust_vector (dict) and Explanation
+(reasons array + summary). NOT CoT extraction -- explicit structured output.
 """
 
 from __future__ import annotations
 
 import json
-import math
-import random
-from pathlib import Path
+import logging
+from typing import TYPE_CHECKING
 
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from autotrust.schemas import Explanation, ScorerOutput
 
-from autotrust.config import load_spec
-from autotrust.export import export_pytorch
-from autotrust.schemas import CheckpointMeta, StudentConfig
-from autotrust.student import (
-    DenseStudent,
-    check_param_budget,
-    compute_escalate_loss,
-    compute_reason_loss,
-    compute_total_loss,
-    compute_trust_loss,
-)
+if TYPE_CHECKING:
+    from autotrust.config import Spec
+    from autotrust.providers import ScoringProvider, TrainingProvider
+    from autotrust.schemas import EmailChain
+
+logger = logging.getLogger(__name__)
 
 
-def load_training_data(synth_dir: Path = Path("synth_data")) -> list[dict]:
-    """Load labeled training records for Stage 2."""
-    data_path = synth_dir / "train_labeled.jsonl"
-    if not data_path.exists():
-        data_path = synth_dir / "train.jsonl"
-    if not data_path.exists():
-        raise FileNotFoundError("No training data found in synth_data/")
+class EmailTrustScorer:
+    """Thread-aware email trust scorer with structured explanation output."""
 
-    records = []
-    for line in data_path.read_text().strip().split("\n"):
-        if line.strip():
-            records.append(json.loads(line))
-    if not records:
-        raise ValueError(f"Training data at {data_path} is empty")
-    return records
+    def __init__(self, provider: ScoringProvider, spec: Spec) -> None:
+        self.provider = provider
+        self.spec = spec
 
+    def score_chain(self, chain: EmailChain) -> ScorerOutput:
+        """Score a single email chain. Returns trust vector + structured explanation."""
+        prompt = self._build_prompt(chain)
+        raw_response = self.provider.score(prompt)
+        return self._parse_response(raw_response)
 
-def _record_text(record: dict) -> str:
-    """Flatten a record into plain text for the compact student.
-    
-    Enhanced: includes thread-level signals like urgency markers,
-    sender changes, and subject line patterns.
-    """
-    emails = record.get("emails", [])
-    parts = []
-    prev_from = None
-    for i, email in enumerate(emails):
-        from_addr = email.get("from_addr", "")
-        to_addr = email.get("to_addr", "")
-        subject = email.get("subject", "")
-        body = email.get("body", "")
-        
-        # Add thread position marker
-        position = f"[EMAIL {i+1}/{len(emails)}]"
-        
-        # Detect authority shift
-        authority_shift = ""
-        if prev_from is not None and from_addr != prev_from:
-            authority_shift = "[SENDER_CHANGE]"
-        prev_from = from_addr
-        
-        # Detect urgency patterns in subject/body
-        urgency_words = ["urgent", "immediate", "asap", "emergency", "critical",
-                         "action required", "deadline", "expires", "limited time",
-                         "act now", "don't delay", "time sensitive"]
-        text_lower = (subject + " " + body).lower()
-        urgency_markers = [w for w in urgency_words if w in text_lower]
-        urgency_tag = f"[URGENCY: {', '.join(urgency_markers)}]" if urgency_markers else ""
-        
-        part = f"{position} {authority_shift}\nFrom: {from_addr}\nTo: {to_addr}\nSubject: {subject}\n{urgency_tag}\n{body}"
-        parts.append(part)
-    
-    return "\n---\n".join(parts)
+    def score_batch(self, chains: list[EmailChain]) -> list[ScorerOutput]:
+        """Score multiple chains (sequential)."""
+        return [self.score_chain(c) for c in chains]
 
+    def _build_prompt(self, chain: EmailChain) -> str:
+        """Build a thread-aware scoring prompt.
 
-def _tokenize(text: str, vocab_size: int, max_seq_len: int) -> tuple[list[int], list[int]]:
-    """Tokenize with byte-level encoding plus bigram hashing for richer features.
-    
-    We use the first half of vocab for raw bytes, second half for bigram hashes.
-    This gives the model access to character-level and pair-level patterns.
-    """
-    raw_bytes = list(text.encode("utf-8")[:max_seq_len])
-    
-    # Build token sequence: interleave bytes with bigram hashes
-    half_vocab = vocab_size // 2
-    tokens = []
-    for i, b in enumerate(raw_bytes):
-        # Raw byte token (clamped to first half of vocab)
-        tokens.append(min(b, half_vocab - 1))
-        # Bigram hash token (in second half of vocab)
-        if i + 1 < len(raw_bytes):
-            bigram_hash = ((b * 31 + raw_bytes[i + 1]) % half_vocab) + half_vocab
-            tokens.append(min(bigram_hash, vocab_size - 1))
-    
-    # Truncate to max_seq_len
-    tokens = tokens[:max_seq_len]
-    
-    if not tokens:
-        tokens = [0]
-    
-    length = len(tokens)
-    if length < max_seq_len:
-        pad = [0] * (max_seq_len - length)
-        tokens = tokens + pad
-    
-    attention = [1] * min(length, max_seq_len) + [0] * max(0, max_seq_len - length)
-    return tokens[:max_seq_len], attention[:max_seq_len]
+        Includes thread encoder signals:
+        - Reply timing analysis
+        - Escalation detection
+        - Authority shifts
+        - Persuasion progression
+        """
+        # Build chain text with thread context
+        thread_parts = []
+        for i, email in enumerate(chain.emails):
+            thread_parts.append(
+                f"--- Email {i + 1} (depth={email.reply_depth}) ---\n"
+                f"From: {email.from_addr}\n"
+                f"To: {email.to_addr}\n"
+                f"Subject: {email.subject}\n"
+                f"Time: {email.timestamp}\n\n"
+                f"{email.body}"
+            )
 
+        thread_text = "\n\n".join(thread_parts)
 
-def _soft_targets(record: dict, axis_names: list[str]) -> dict[str, float]:
-    """Extract soft targets with a safe fallback order."""
-    source = (
-        record.get("soft_targets")
-        or record.get("trust_vector")
-        or record.get("labels")
-        or {}
-    )
-    return {axis: float(source.get(axis, 0.0)) for axis in axis_names}
+        # Thread encoder signals
+        signals = self._extract_thread_signals(chain)
+        signals_text = "\n".join(f"- {s}" for s in signals) if signals else "None detected"
 
+        # Build axis list
+        axes_desc = ", ".join(
+            f'"{a.name}" ({a.type}, weight={a.weight})'
+            for a in self.spec.trust_axes
+        )
 
-def build_dataset(
-    records: list[dict],
-    axis_names: list[str],
-    subtle_axes: list[str],
-    flag_threshold: float,
-    escalate_threshold: float,
-    *,
-    vocab_size: int,
-    max_seq_len: int,
-) -> TensorDataset:
-    """Convert JSONL records into tensors for the dense baseline."""
-    input_ids = []
-    attention_masks = []
-    trust_targets = []
-    reason_targets = []
-    escalate_targets = []
+        prompt = f"""Analyze this email chain for trust signals across these axes: [{axes_desc}]
 
-    for record in records:
-        text = _record_text(record)
-        ids, attention = _tokenize(text, vocab_size=vocab_size, max_seq_len=max_seq_len)
-        soft = _soft_targets(record, axis_names)
-        reason = [1.0 if soft[axis] > flag_threshold else 0.0 for axis in axis_names]
-        escalate = 1.0 if any(soft.get(axis, 0.0) >= escalate_threshold for axis in subtle_axes) else 0.0
+THREAD SIGNALS:
+{signals_text}
 
-        input_ids.append(ids)
-        attention_masks.append(attention)
-        trust_targets.append([soft[axis] for axis in axis_names])
-        reason_targets.append(reason)
-        escalate_targets.append([escalate])
+EMAIL CHAIN:
+{thread_text}
 
-    return TensorDataset(
-        torch.tensor(input_ids, dtype=torch.long),
-        torch.tensor(attention_masks, dtype=torch.long),
-        torch.tensor(trust_targets, dtype=torch.float32),
-        torch.tensor(reason_targets, dtype=torch.float32),
-        torch.tensor(escalate_targets, dtype=torch.float32),
-    )
+Respond with a JSON object containing:
+1. "trust_vector": a dict mapping each axis name to a float score from 0.0 (safe) to 1.0 (maximum concern)
+2. "explanation": an object with:
+   - "reasons": a list of axis names or semantic references for axes scoring above 0.5
+   - "summary": a one-sentence human-readable summary
 
+Respond ONLY with valid JSON. Example format:
+{{"trust_vector": {{"phish": 0.9, ...}}, "explanation": {{"reasons": ["phish", "manipulation"], "summary": "..."}}}}
 
-def collect_expert_utilization(model) -> list[float] | None:
-    """Collect averaged expert utilization from a trained MoE model."""
-    layers = getattr(model, "layers", None)
-    if layers is None:
-        return None
+JSON:"""
+        return prompt
 
-    vectors = []
-    for layer in layers:
-        moe_block = getattr(layer, "moe_block", None)
-        util = getattr(moe_block, "last_expert_utilization", None) if moe_block is not None else None
-        if util is not None:
-            vectors.append(util.detach().cpu())
+    def _extract_thread_signals(self, chain: EmailChain) -> list[str]:
+        """Extract thread-aware signals from the email chain."""
+        signals = []
 
-    if not vectors:
-        return None
+        if len(chain.emails) > 1:
+            # Reply timing
+            for i in range(1, len(chain.emails)):
+                prev_time = chain.emails[i - 1].timestamp
+                curr_time = chain.emails[i].timestamp
+                delta = (curr_time - prev_time).total_seconds()
+                if delta < 300:  # < 5 minutes
+                    signals.append(f"Rapid reply at email {i + 1} ({delta:.0f}s)")
 
-    mean_util = torch.stack(vectors).mean(dim=0)
-    return [round(float(v), 6) for v in mean_util]
+            # Escalation detection
+            depths = [e.reply_depth for e in chain.emails]
+            if len(set(depths)) > 1:
+                signals.append(f"Thread depth escalation: {depths}")
 
+            # Authority shifts
+            senders = [e.from_addr for e in chain.emails]
+            if len(set(senders)) > 1:
+                signals.append(f"Sender changes in thread: {senders}")
 
-def evaluate_model(model, loader, device="cpu"):
-    """Evaluate model on a data loader, return average losses."""
-    model.eval()
-    total_trust = 0.0
-    total_reason = 0.0
-    total_escalate = 0.0
-    total_loss = 0.0
-    n_batches = 0
+        # Urgency keywords
+        all_text = " ".join(e.subject + " " + e.body for e in chain.emails).lower()
+        urgency_words = ["urgent", "immediately", "asap", "right now", "deadline"]
+        found_urgency = [w for w in urgency_words if w in all_text]
+        if found_urgency:
+            signals.append(f"Urgency signals: {found_urgency}")
 
-    with torch.no_grad():
-        for batch in loader:
-            input_ids, attention_mask, trust_targets, reason_targets, escalate_targets = [
-                b.to(device) for b in batch
-            ]
-            output = model(input_ids, attention_mask=attention_mask)
+        # Authority claims
+        authority_words = ["ceo", "cfo", "director", "manager", "admin", "it department"]
+        found_authority = [w for w in authority_words if w in all_text]
+        if found_authority:
+            signals.append(f"Authority claims: {found_authority}")
 
-            trust_loss = compute_trust_loss(output["trust_logits"], trust_targets)
-            reason_loss = compute_reason_loss(output["reason_logits"], reason_targets)
-            escalate_loss = compute_escalate_loss(output["escalate_logit"], escalate_targets)
-            loss = compute_total_loss(trust_loss, reason_loss, escalate_loss)
+        return signals
 
-            total_trust += trust_loss.item()
-            total_reason += reason_loss.item()
-            total_escalate += escalate_loss.item()
-            total_loss += loss.item()
-            n_batches += 1
+    def _parse_response(self, raw: str) -> ScorerOutput:
+        """Parse LLM response into ScorerOutput."""
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Try to extract JSON from response
+            import re
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+            else:
+                logger.error("Failed to parse response as JSON: %s", raw[:200])
+                # Return default scores
+                return self._default_output()
 
-    model.train()
-    if n_batches == 0:
-        return {"trust_loss": 0.0, "reason_loss": 0.0, "escalate_loss": 0.0, "total_loss": 0.0}
-    return {
-        "trust_loss": round(total_trust / n_batches, 6),
-        "reason_loss": round(total_reason / n_batches, 6),
-        "escalate_loss": round(total_escalate / n_batches, 6),
-        "total_loss": round(total_loss / n_batches, 6),
-    }
+        trust_vector = data.get("trust_vector", {})
+        explanation_data = data.get("explanation", {})
 
+        # Ensure all axes are present
+        for axis in self.spec.trust_axes:
+            if axis.name not in trust_vector:
+                trust_vector[axis.name] = 0.0
 
-def train() -> Path:
-    """Train an improved dense baseline with better hyperparameters and all data."""
-    torch.manual_seed(42)
-    random.seed(42)
+        # Clamp values to [0, 1]
+        trust_vector = {
+            k: max(0.0, min(1.0, float(v)))
+            for k, v in trust_vector.items()
+            if k in {a.name for a in self.spec.trust_axes}
+        }
 
-    spec = load_spec()
-    axis_names = [axis.name for axis in spec.trust_axes]
-    records = load_training_data()
+        explanation = Explanation(
+            reasons=explanation_data.get("reasons", []),
+            summary=explanation_data.get("summary", "No summary provided."),
+        )
 
-    # Use a larger model with more capacity
-    config = StudentConfig(
-        hidden_size=128,
-        num_layers=4,
-        vocab_size=512,       # Larger vocab for bigram hashing
-        max_seq_len=512,      # Longer sequences to capture more content
-        num_axes=len(axis_names),
-        num_reason_tags=len(axis_names),
-    )
-    model = DenseStudent.from_config(config)
-    check_param_budget(model, spec)
-    
-    print(f"Model param count: {model.param_count():,}")
-    print(f"Training records: {len(records)}")
+        return ScorerOutput(trust_vector=trust_vector, explanation=explanation)
 
-    # Use ALL training data
-    dataset = build_dataset(
-        records,
-        axis_names,
-        spec.axis_groups.subtle,
-        spec.explanation.flag_threshold,
-        spec.judge.escalate_threshold,
-        vocab_size=config.vocab_size,
-        max_seq_len=config.max_seq_len,
-    )
+    def _default_output(self) -> ScorerOutput:
+        """Return default output when parsing fails."""
+        return ScorerOutput(
+            trust_vector={a.name: 0.0 for a in self.spec.trust_axes},
+            explanation=Explanation(reasons=[], summary="Failed to parse response."),
+        )
 
-    # Split into train/val (90/10)
-    n_val = max(1, len(dataset) // 10)
-    n_train = len(dataset) - n_val
-    train_dataset, val_dataset = random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
-    )
+    # ---------------------------------------------------------------------------
+    # LoRA scaffolding (placeholders)
+    # ---------------------------------------------------------------------------
 
-    batch_size = min(32, n_train) or 1
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    def fine_tune(self, data_path: str, trainer: TrainingProvider) -> str:
+        """Placeholder: LoRA fine-tune via TrainingProvider. Returns checkpoint path."""
+        raise NotImplementedError("LoRA fine-tuning not yet implemented")
 
-    # AdamW with weight decay
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-2)
-    
-    # Cosine annealing LR schedule
-    num_epochs = 15
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_epochs, eta_min=1e-5
-    )
-
-    model.train()
-    best_val_loss = float("inf")
-    best_state = None
-    patience = 5
-    no_improve_count = 0
-    
-    final_losses = {
-        "trust_loss": 0.0,
-        "reason_loss": 0.0,
-        "escalate_loss": 0.0,
-        "total_loss": 0.0,
-    }
-
-    for epoch in range(num_epochs):
-        model.train()
-        epoch_trust = 0.0
-        epoch_reason = 0.0
-        epoch_escalate = 0.0
-        epoch_total = 0.0
-        n_batches = 0
-
-        for batch in train_loader:
-            input_ids, attention_mask, trust_targets, reason_targets, escalate_targets = batch
-            output = model(input_ids, attention_mask=attention_mask)
-
-            trust_loss = compute_trust_loss(output["trust_logits"], trust_targets)
-            reason_loss = compute_reason_loss(output["reason_logits"], reason_targets)
-            escalate_loss = compute_escalate_loss(output["escalate_logit"], escalate_targets)
-            total_loss = compute_total_loss(trust_loss, reason_loss, escalate_loss)
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-
-            epoch_trust += trust_loss.item()
-            epoch_reason += reason_loss.item()
-            epoch_escalate += escalate_loss.item()
-            epoch_total += total_loss.item()
-            n_batches += 1
-
-        scheduler.step()
-
-        # Compute epoch averages
-        if n_batches > 0:
-            final_losses = {
-                "trust_loss": round(epoch_trust / n_batches, 6),
-                "reason_loss": round(epoch_reason / n_batches, 6),
-                "escalate_loss": round(epoch_escalate / n_batches, 6),
-                "total_loss": round(epoch_total / n_batches, 6),
-            }
-
-        # Validation
-        val_losses = evaluate_model(model, val_loader)
-        val_loss = val_losses["total_loss"]
-
-        lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch+1}/{num_epochs} | "
-              f"Train Loss: {final_losses['total_loss']:.4f} | "
-              f"Val Loss: {val_loss:.4f} | "
-              f"LR: {lr:.6f}")
-
-        # Early stopping with patience
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            no_improve_count = 0
-        else:
-            no_improve_count += 1
-            if no_improve_count >= patience:
-                print(f"Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
-                break
-
-    # Restore best model
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        print(f"Restored best model with val loss: {best_val_loss:.4f}")
-
-    # Final validation evaluation
-    final_val = evaluate_model(model, val_loader)
-    print(f"Final val losses: {final_val}")
-
-    checkpoint_dir = Path("runs/latest/checkpoints")
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = checkpoint_dir / "best.pt"
-    meta = CheckpointMeta(
-        stage="dense_baseline",
-        experiment_num=0,
-        composite=0.0,
-        path=checkpoint_path,
-        param_count=model.param_count(),
-    )
-    export_pytorch(model, config, meta, checkpoint_path)
-
-    metrics = {
-        "training_loss": final_losses,
-        "validation_loss": final_val,
-        "best_val_loss": round(best_val_loss, 6),
-        "param_count": model.param_count(),
-        "num_epochs_run": epoch + 1,
-        "num_records": len(records),
-        "config": {
-            "hidden_size": config.hidden_size,
-            "num_layers": config.num_layers,
-            "vocab_size": config.vocab_size,
-            "max_seq_len": config.max_seq_len,
-        },
-    }
-    expert_utilization = collect_expert_utilization(model)
-    if expert_utilization is not None:
-        metrics["expert_utilization"] = expert_utilization
-    (checkpoint_dir / "training_metrics.json").write_text(json.dumps(metrics, indent=2))
-    print(json.dumps(metrics))
-    return checkpoint_path
-
-
-if __name__ == "__main__":
-    train()
+    def load_fine_tuned(self, checkpoint: str) -> None:
+        """Placeholder: Load LoRA checkpoint."""
+        raise NotImplementedError("LoRA loading not yet implemented")

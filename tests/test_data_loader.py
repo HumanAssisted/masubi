@@ -1,6 +1,7 @@
 """Tests for autotrust/dashboard/data_loader.py -- filesystem-based run data reader."""
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,17 @@ def test_list_runs_empty_dir(tmp_path):
     assert runs == []
 
 
+def test_list_runs_skips_latest_dir(tmp_path):
+    """The synthetic runs/latest directory should not appear as a selectable run."""
+    from autotrust.dashboard.data_loader import list_runs
+
+    latest_dir = tmp_path / "latest"
+    latest_dir.mkdir()
+
+    runs = list_runs(base_dir=tmp_path)
+    assert runs == []
+
+
 def test_list_runs_detects_running_status(tmp_path, sample_experiment):
     """Run with status.json and no summary.txt should show status 'running'."""
     from autotrust.dashboard.data_loader import list_runs
@@ -84,6 +96,19 @@ def test_list_runs_detects_running_status(tmp_path, sample_experiment):
     runs = list_runs(base_dir=tmp_path)
     assert len(runs) == 1
     assert runs[0]["status"] == "running"
+
+
+def test_list_runs_marks_stale_running_status_as_interrupted(tmp_path, sample_experiment):
+    """Old running heartbeats should not keep hijacking the Live tab forever."""
+    from autotrust.dashboard.data_loader import list_runs
+
+    run_dir = _create_run_dir(tmp_path, "run_stale", [sample_experiment])
+    stale_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    (run_dir / "status.json").write_text(json.dumps({"state": "running", "updated_at": stale_time}))
+
+    runs = list_runs(base_dir=tmp_path)
+    assert len(runs) == 1
+    assert runs[0]["status"] == "interrupted"
 
 
 def test_list_runs_marks_orphaned_metrics_as_interrupted(tmp_path, sample_experiment):
@@ -110,6 +135,19 @@ def test_list_runs_detects_starting_status_from_config_only(tmp_path):
     assert len(runs) == 1
     assert runs[0]["status"] == "starting"
     assert runs[0]["status_message"] == "Loading eval chains."
+
+
+def test_list_runs_hides_zero_experiment_completed_runs(tmp_path):
+    """Completed zero-experiment runs should not clutter the dashboard dropdown."""
+    from autotrust.dashboard.data_loader import list_runs
+
+    run_dir = tmp_path / "run_zero"
+    run_dir.mkdir()
+    (run_dir / "summary.txt").write_text("Run ID: run_zero\nExperiments: 0\n")
+    (run_dir / "status.json").write_text(json.dumps({"state": "completed", "message": "Done"}))
+
+    runs = list_runs(base_dir=tmp_path)
+    assert runs == []
 
 
 def test_load_run_metrics_parses_jsonl(tmp_path, sample_experiment):

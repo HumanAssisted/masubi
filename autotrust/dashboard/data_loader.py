@@ -4,9 +4,28 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_ACTIVE_STATES = {"starting", "running", "paused", "stopping", "finalizing"}
+_STALE_STATUS_SECONDS = 15 * 60
+
+
+def _status_is_fresh(status: dict, max_age_seconds: int = _STALE_STATUS_SECONDS) -> bool:
+    """Return True when a run heartbeat was updated recently enough to count as live."""
+    updated_at = status.get("updated_at")
+    if not updated_at:
+        return True
+    try:
+        updated = datetime.fromisoformat(updated_at)
+    except ValueError:
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - updated).total_seconds()
+    return age <= max_age_seconds
 
 
 def load_run_status(run_id: str, base_dir: Path = Path("runs")) -> dict:
@@ -57,7 +76,7 @@ def list_runs(base_dir: Path = Path("runs")) -> list[dict]:
 
     runs = []
     for entry in base_dir.iterdir():
-        if not entry.is_dir():
+        if not entry.is_dir() or entry.name == "latest":
             continue
 
         run_id = entry.name
@@ -102,13 +121,18 @@ def list_runs(base_dir: Path = Path("runs")) -> list[dict]:
                 elif line.startswith("Run ID:"):
                     pass  # already have it
             info["status"] = "completed"
-        elif status.get("state"):
+        elif status.get("state") in _ACTIVE_STATES and _status_is_fresh(status):
             info["status"] = status["state"]
+        elif status.get("state"):
+            info["status"] = "interrupted"
         elif metrics_path.exists():
             info["status"] = "interrupted"
 
         if status.get("message"):
             info["status_message"] = status["message"]
+
+        if info["experiment_count"] == 0 and info["status"] not in _ACTIVE_STATES:
+            continue
 
         runs.append(info)
 

@@ -1,6 +1,7 @@
 """Tests for autotrust/dashboard/run_manager.py -- thread management."""
 
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -53,6 +54,24 @@ def test_completed_summary_only_run_is_detected(tmp_path):
 
     run_id, state = RunManager._detect_active_run_with_state(base_dir=tmp_path)
     assert run_id == run_dir.name
+    assert state == "completed"
+
+
+def test_stale_running_status_does_not_beat_completed_run(tmp_path):
+    """Old external heartbeats should not keep the Live tab pinned to dead runs."""
+    from autotrust.dashboard.run_manager import RunManager
+
+    stale_run = tmp_path / "20260315_010000_deadbeef"
+    stale_run.mkdir()
+    stale_time = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    (stale_run / "status.json").write_text(f'{{"state": "running", "updated_at": "{stale_time}"}}')
+
+    completed_run = tmp_path / "20260315_020000_goodbeef"
+    completed_run.mkdir()
+    (completed_run / "summary.txt").write_text("Run ID: 20260315_020000_goodbeef\nExperiments: 1\n")
+
+    run_id, state = RunManager._detect_active_run_with_state(base_dir=tmp_path)
+    assert run_id == completed_run.name
     assert state == "completed"
 
 

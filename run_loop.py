@@ -15,6 +15,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -809,6 +810,63 @@ def _find_latest_checkpoint() -> Path | None:
     return max(checkpoints, key=lambda p: p.stat().st_mtime)
 
 
+def _root_exception(exc: BaseException) -> BaseException:
+    """Follow chained exceptions to the deepest available root cause."""
+    root = exc
+    seen: set[int] = set()
+    while True:
+        next_exc = getattr(root, "__cause__", None) or getattr(root, "__context__", None)
+        if next_exc is None or id(next_exc) in seen:
+            return root
+        seen.add(id(next_exc))
+        root = next_exc
+
+
+def _format_agent_exception(exc: BaseException) -> str:
+    """Render Anthropic/httpx exceptions into a useful single-line diagnostic."""
+    parts = [type(exc).__name__]
+
+    message = str(exc).strip()
+    if message:
+        parts.append(message)
+
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        parts.append(f"status={status_code}")
+
+    request_id = getattr(exc, "request_id", None)
+    if request_id:
+        parts.append(f"request_id={request_id}")
+
+    request = getattr(exc, "request", None)
+    if request is not None:
+        method = getattr(request, "method", None)
+        url = getattr(request, "url", None)
+        if method or url:
+            parts.append(f"request={method or '?'} {url or ''}".strip())
+
+    body = getattr(exc, "body", None)
+    if body not in (None, ""):
+        try:
+            body_text = json.dumps(body, sort_keys=True)
+        except TypeError:
+            body_text = str(body)
+        parts.append(f"body={body_text[:240]}")
+
+    root = _root_exception(exc)
+    if root is not exc:
+        root_message = str(root).strip()
+        if root_message:
+            parts.append(f"root_cause={type(root).__name__}: {root_message}")
+        else:
+            parts.append(f"root_cause={type(root).__name__}")
+
+    if type(exc).__name__ == "APIConnectionError":
+        parts.append("No HTTP response received from Anthropic; this is a transport/connectivity failure.")
+
+    return " | ".join(parts)
+
+
 def _call_agent(prompt: str, spec: Any) -> str | None:
     """Call Anthropic Sonnet with tool-use to propose train.py edits.
 
@@ -825,7 +883,8 @@ def _call_agent(prompt: str, spec: Any) -> str | None:
         logger.error("anthropic package not installed.")
         return None
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # Disable SDK-managed retries so we can log clearer retry reasons ourselves.
+    client = anthropic.Anthropic(api_key=api_key, max_retries=0)
 
     # Use tool-use to get structured edits
     tools = [
@@ -845,13 +904,37 @@ def _call_agent(prompt: str, spec: Any) -> str | None:
         },
     ]
 
-    response = client.messages.create(
-        model=spec.providers.agent.model,
-        max_tokens=16384,
-        tools=tools,
-        tool_choice={"type": "tool", "name": "edit_train_py"},
-        messages=[{"role": "user", "content": prompt}],
-    )
+    max_attempts = 3
+    base_delay = 0.5
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.messages.create(
+                model=spec.providers.agent.model,
+                max_tokens=16384,
+                tools=tools,
+                tool_choice={"type": "tool", "name": "edit_train_py"},
+                messages=[{"role": "user", "content": prompt}],
+            )
+            break
+        except anthropic.APIConnectionError as exc:
+            error_text = _format_agent_exception(exc)
+            if attempt < max_attempts:
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "Agent request transient failure",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    retry_in_sec=f"{delay:.1f}",
+                    error=error_text,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(error_text) from exc
+        except anthropic.APIStatusError as exc:
+            raise RuntimeError(_format_agent_exception(exc)) from exc
+        except Exception as exc:
+            raise RuntimeError(_format_agent_exception(exc)) from exc
 
     # Extract tool use from response
     for block in response.content:
@@ -937,7 +1020,6 @@ def run_autoresearch(
 
     try:
         # Ensure train.py exists as working copy from the canonical template
-        import shutil
         starting = Path("starting_train.py")
         working = Path("train.py")
         if starting.exists() and (not working.exists() or stage == "prompt"):
@@ -1546,6 +1628,9 @@ def run_autoresearch(
             total_cost=f"${total_cost:.2f}",
             total_time=f"{(time.time() - start_time) / 60:.1f}m",
         )
+        if mock_agent and not all_results:
+            shutil.rmtree(run_ctx.run_dir, ignore_errors=True)
+            logger.info("Cleaned up mock-agent run artifacts", run_id=run_ctx.run_id)
     except Exception as exc:
         update_run_status(
             run_ctx,

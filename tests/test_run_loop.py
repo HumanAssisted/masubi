@@ -1,6 +1,8 @@
 """Tests for run_loop.py -- thin orchestration."""
 
+import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 from pathlib import Path
@@ -379,3 +381,142 @@ def test_callbacks_default_none_backward_compatible(spec, tmp_path):
         # Should work without passing any callbacks
         run_autoresearch(max_experiments=10)
         # No crash = backward compatible
+
+
+def test_mock_agent_zero_result_run_is_cleaned_up(spec, isolated_workspace):
+    """Mock-agent smoke runs with no logged experiments should not clutter runs/."""
+    from run_loop import run_autoresearch
+
+    with patch("run_loop.get_spec", return_value=spec), \
+         patch("run_loop.load_calibration", return_value=MagicMock()), \
+         patch("run_loop.load_eval_chains", return_value=[MagicMock()]), \
+         patch("run_loop.load_gold_chains", return_value=[]):
+        run_autoresearch(max_experiments=1, mock_agent=True)
+
+    runs_dir = Path("runs")
+    if runs_dir.exists():
+        remaining = [entry for entry in runs_dir.iterdir() if entry.is_dir()]
+        assert remaining == []
+
+
+def test_format_agent_exception_surfaces_status_and_root_cause():
+    """Agent errors should expose status/body/request details instead of a flat message."""
+    from run_loop import _format_agent_exception
+
+    request = SimpleNamespace(method="POST", url="https://api.anthropic.com/v1/messages")
+
+    class FakeStatusError(Exception):
+        def __init__(self):
+            super().__init__("Error code: 429 - {'error': 'rate_limited'}")
+            self.status_code = 429
+            self.request_id = "req_test_123"
+            self.body = {"error": "rate_limited"}
+            self.request = request
+
+    exc = FakeStatusError()
+    exc.__cause__ = OSError("network temporarily unavailable")
+
+    rendered = _format_agent_exception(exc)
+    assert "FakeStatusError" in rendered
+    assert "status=429" in rendered
+    assert "request_id=req_test_123" in rendered
+    assert "request=POST https://api.anthropic.com/v1/messages" in rendered
+    assert "root_cause=OSError: network temporarily unavailable" in rendered
+
+
+def test_call_agent_retries_connection_errors_with_clear_message(spec, monkeypatch):
+    """_call_agent should retry transport errors itself and succeed without SDK retry spam."""
+    from run_loop import _call_agent
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    request = SimpleNamespace(method="POST", url="https://api.anthropic.com/v1/messages")
+    attempts = {"count": 0}
+
+    class FakeAPIStatusError(Exception):
+        pass
+
+    class FakeAPIConnectionError(Exception):
+        def __init__(self, message="Connection error."):
+            super().__init__(message)
+            self.request = request
+            self.body = None
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                err = FakeAPIConnectionError()
+                err.__cause__ = ConnectionError("dns lookup failed")
+                raise err
+            return SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        type="tool_use",
+                        name="edit_train_py",
+                        input={"new_content": "print('ok')"},
+                    )
+                ]
+            )
+
+    class FakeClient:
+        def __init__(self, api_key, max_retries=0):
+            self.api_key = api_key
+            self.max_retries = max_retries
+            self.messages = FakeMessages()
+
+    fake_anthropic = SimpleNamespace(
+        Anthropic=FakeClient,
+        APIConnectionError=FakeAPIConnectionError,
+        APIStatusError=FakeAPIStatusError,
+    )
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+
+    with patch("run_loop.time.sleep") as mock_sleep:
+        result = _call_agent("hello", spec)
+
+    assert result == "print('ok')"
+    assert attempts["count"] == 2
+    mock_sleep.assert_called_once()
+
+
+def test_call_agent_raises_clear_status_error(spec, monkeypatch):
+    """_call_agent should surface status/request/body fields for non-transport API failures."""
+    from run_loop import _call_agent
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    request = SimpleNamespace(method="POST", url="https://api.anthropic.com/v1/messages")
+
+    class FakeAPIConnectionError(Exception):
+        pass
+
+    class FakeAPIStatusError(Exception):
+        def __init__(self):
+            super().__init__("Error code: 401 - {'error': 'invalid_api_key'}")
+            self.status_code = 401
+            self.request_id = "req_auth_1"
+            self.body = {"error": "invalid_api_key"}
+            self.request = request
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            raise FakeAPIStatusError()
+
+    class FakeClient:
+        def __init__(self, api_key, max_retries=0):
+            self.messages = FakeMessages()
+
+    fake_anthropic = SimpleNamespace(
+        Anthropic=FakeClient,
+        APIConnectionError=FakeAPIConnectionError,
+        APIStatusError=FakeAPIStatusError,
+    )
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _call_agent("hello", spec)
+
+    message = str(exc_info.value)
+    assert "status=401" in message
+    assert "request_id=req_auth_1" in message
+    assert "body={\"error\": \"invalid_api_key\"}" in message
