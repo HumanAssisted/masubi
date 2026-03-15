@@ -21,6 +21,30 @@ def load_run_status(run_id: str, base_dir: Path = Path("runs")) -> dict:
         return {}
 
 
+def load_run_status_history(
+    run_id: str,
+    limit: int = 20,
+    base_dir: Path = Path("runs"),
+) -> list[dict]:
+    """Load recent status-history events for a run."""
+    history_path = base_dir / run_id / "status_history.jsonl"
+    if not history_path.exists():
+        return []
+
+    records = []
+    for line in history_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            logger.warning("Skipping malformed status-history line in %s", history_path)
+
+    if limit <= 0:
+        return records
+    return records[-limit:]
+
+
 def list_runs(base_dir: Path = Path("runs")) -> list[dict]:
     """List all runs with metadata from summary.txt and metrics.jsonl.
 

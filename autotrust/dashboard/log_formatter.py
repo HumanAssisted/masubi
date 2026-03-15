@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from autotrust.dashboard.utils import is_kept as _is_kept
 
 
@@ -142,3 +144,42 @@ def format_log_stream(metrics: list[dict]) -> str:
     # Reverse so newest is first
     entries.reverse()
     return "\n".join(entries)
+
+
+def _format_status_time(updated_at: str) -> str:
+    """Format ISO timestamps into HH:MM:SS when possible."""
+    if not updated_at:
+        return "--:--:--"
+    try:
+        return datetime.fromisoformat(updated_at).strftime("%H:%M:%S")
+    except ValueError:
+        return updated_at
+
+
+def format_status_history(events: list[dict]) -> str:
+    """Format run status-history events as a newest-first live log."""
+    if not events:
+        return "No experiments yet."
+
+    lines = []
+    for event in reversed(events):
+        time_str = _format_status_time(event.get("updated_at", ""))
+        phase = event.get("phase", "status")
+        message = event.get("message", "")
+        stage = event.get("stage")
+        experiment_num = event.get("experiment_num")
+        prefix = f"[{time_str}]"
+
+        parts = [prefix]
+        if stage:
+            parts.append(stage)
+        if experiment_num is not None:
+            parts.append(f"exp #{experiment_num}")
+        parts.append(phase)
+        if message:
+            parts.append(message)
+        if event.get("error"):
+            parts.append(f"ERROR: {event['error']}")
+        lines.append(" | ".join(parts))
+
+    return "\n".join(lines)

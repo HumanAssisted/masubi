@@ -18,7 +18,9 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -45,6 +47,7 @@ from autotrust.observe import (
 )
 from autotrust.schemas import (
     CalibrationReport,
+    Email,
     EmailChain,
     ExperimentResult,
 )
@@ -153,6 +156,134 @@ def _chain_text(chain: EmailChain) -> str:
         f"From: {e.from_addr}\nTo: {e.to_addr}\nSubject: {e.subject}\n{e.body}"
         for e in chain.emails
     )
+
+
+def _artifact_dir(run_ctx: Any, experiment_num: int) -> Path:
+    """Return the artifact directory for a specific experiment."""
+    artifact_dir = run_ctx.run_dir / "artifacts" / f"exp_{experiment_num:03d}"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    return artifact_dir
+
+
+def _write_run_artifact(
+    run_ctx: Any,
+    experiment_num: int,
+    filename: str,
+    content: str,
+) -> Path:
+    """Persist an experiment artifact under runs/<run_id>/artifacts/."""
+    path = _artifact_dir(run_ctx, experiment_num) / filename
+    path.write_text(content)
+    return path
+
+
+def _summarize_error(error_text: str, fallback: str = "unknown error") -> str:
+    """Return a compact single-line summary from a traceback or error string."""
+    lines = [line.strip() for line in error_text.splitlines() if line.strip()]
+    if not lines:
+        return fallback
+    return lines[-1][:300]
+
+
+class _Stage1ValidationProvider:
+    """Deterministic provider used to smoke-test agent-edited Stage 1 scorers."""
+
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = responses
+        self._index = 0
+
+    def score(self, prompt: str, **kwargs: Any) -> str:
+        if not self._responses:
+            raise RuntimeError("No validation responses configured")
+        idx = min(self._index, len(self._responses) - 1)
+        self._index += 1
+        return self._responses[idx]
+
+    def score_batch(self, prompts: list[str], **kwargs: Any) -> list[str]:
+        return [self.score(prompt, **kwargs) for prompt in prompts]
+
+
+def _build_stage1_validation_chain(spec: Any) -> EmailChain:
+    """Build a minimal but realistic chain for scorer smoke tests."""
+    axis_scores = {axis.name: 0.0 for axis in spec.trust_axes}
+    email = Email(
+        from_addr="ceo@example.com",
+        to_addr="finance@example.com",
+        subject="Urgent wire transfer",
+        body="Please wire funds immediately and keep this confidential.",
+        timestamp=datetime.now(timezone.utc),
+        reply_depth=0,
+    )
+    return EmailChain(
+        chain_id="validation-001",
+        emails=[email],
+        labels=axis_scores,
+        trust_vector=axis_scores,
+        composite=0.0,
+        flags=[],
+    )
+
+
+def _build_stage1_validation_responses(spec: Any) -> list[str]:
+    """Representative raw model responses used to test parser robustness."""
+    payload = json.dumps(
+        {
+            "trust_vector": {axis.name: 0.5 for axis in spec.trust_axes},
+            "explanation": {
+                "reasons": ["phish", "manipulation"],
+                "summary": "Validation response.",
+            },
+        }
+    )
+    return [
+        payload,
+        f"Here is the JSON:\n```json\n{payload}\n```",
+        f"```json\n{payload}\n```",
+    ]
+
+
+def _validate_stage1_candidate(train_path: Path, spec: Any) -> str | None:
+    """Smoke-test an agent-edited Stage 1 scorer before live provider calls."""
+    try:
+        scorer_cls = _load_stage1_scorer_class(train_path)
+        responses = _build_stage1_validation_responses(spec)
+        scorer = scorer_cls(provider=_Stage1ValidationProvider(responses), spec=spec)
+        chains = [_build_stage1_validation_chain(spec) for _ in responses]
+        outputs = scorer.score_batch(chains)
+        expected_axes = {axis.name for axis in spec.trust_axes}
+
+        if len(outputs) != len(chains):
+            raise ValueError(
+                f"score_batch returned {len(outputs)} outputs for {len(chains)} chains"
+            )
+
+        for index, output in enumerate(outputs, 1):
+            actual_axes = set(output.trust_vector.keys())
+            if actual_axes != expected_axes:
+                raise ValueError(
+                    f"validation output {index} axes mismatch: expected {sorted(expected_axes)}, got {sorted(actual_axes)}"
+                )
+            if not isinstance(output.explanation.summary, str):
+                raise TypeError(f"validation output {index} explanation summary must be a string")
+            if not isinstance(output.explanation.reasons, list):
+                raise TypeError(f"validation output {index} explanation reasons must be a list")
+
+        return None
+    except Exception:
+        return traceback.format_exc()
+
+
+def _capture_candidate_failure(
+    run_ctx: Any,
+    experiment_num: int,
+    candidate_source: str,
+    phase: str,
+    error_text: str,
+) -> tuple[Path, Path]:
+    """Persist the candidate train.py plus its failure traceback."""
+    candidate_path = _write_run_artifact(run_ctx, experiment_num, "candidate_train.py", candidate_source)
+    error_path = _write_run_artifact(run_ctx, experiment_num, f"{phase}_error.txt", error_text)
+    return candidate_path, error_path
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -282,6 +413,12 @@ def _build_agent_prompt(
 
 ## Last Experiment Results
 {json.dumps(last_results[-3:], indent=2, default=str) if last_results else 'No previous results.'}
+"""
+    prompt += """
+## Guardrails
+- Keep Stage 1 JSON parsing simple and robust.
+- Do not use brittle regex cleanup or regex backreferences in replacement strings.
+- Candidate Stage 1 code must handle both plain JSON and code-fenced JSON responses.
 """
     if stage == "train" and spec is not None:
         # Stage 2: include model architecture constraints
@@ -798,7 +935,7 @@ def run_autoresearch(
                     consecutive_no_improvement += 1
                     continue
                 except Exception as exc:
-                    logger.error("Agent call failed: %s", exc)
+                    logger.error("Agent call failed", error=str(exc))
                     update_run_status(
                         run_ctx,
                         state="running",
@@ -829,7 +966,7 @@ def run_autoresearch(
                     )
                     consecutive_no_improvement += 1
                     continue
-                logger.info("Scoring %d eval chains...", len(eval_chains))
+                logger.info("Scoring eval chains...", count=len(eval_chains))
                 update_run_status(
                     run_ctx,
                     state="running",
@@ -851,7 +988,7 @@ def run_autoresearch(
                     logger.info("Scoring complete", chains=len(outputs), duration_sec=f"{score_duration:.1f}s")
                     _check_experiment_timeout(experiment_start, spec)
                 except ExperimentTimeout as exc:
-                    logger.warning("Experiment %d timed out during scoring: %s", experiment_num, exc)
+                    logger.warning("Experiment timed out during scoring", experiment=experiment_num, error=str(exc))
                     update_run_status(
                         run_ctx,
                         state="running",
@@ -865,7 +1002,7 @@ def run_autoresearch(
                     consecutive_no_improvement += 1
                     continue
                 except Exception as exc:
-                    logger.error("Scoring failed: %s", exc)
+                    logger.error("Scoring failed", error=str(exc))
                     update_run_status(
                         run_ctx,
                         state="running",
@@ -910,7 +1047,7 @@ def run_autoresearch(
                     gold_predictions = [o.trust_vector for o in gold_outputs]
                     experiment_cost += 0.02 * len(gold_predictions)
                 except Exception as exc:
-                    logger.error("Gold-set scoring failed: %s", exc)
+                    logger.error("Gold-set scoring failed", error=str(exc))
                     update_run_status(
                         run_ctx,
                         state="running",
@@ -965,7 +1102,7 @@ def run_autoresearch(
             )
 
             keep = keep_or_discard(composite_improved, gold_ok, expl_ok)
-            logger.info("Decision: %s", "KEEP" if keep else "DISCARD")
+            logger.info("Decision", result="KEEP" if keep else "DISCARD")
 
             _handle_keep_discard(keep, experiment_num)
 
@@ -1092,10 +1229,10 @@ def _launch_dashboard(port: int = 7860) -> None:
 
     if status == "ok":
         webbrowser.open(payload)
-        logger.info("Dashboard launched at %s", payload)
+        logger.info("Dashboard launched", url=payload)
         return
 
-    logger.warning("Dashboard failed to start: %s", payload)
+    logger.warning("Dashboard failed to start", error=str(payload))
 
 
 if __name__ == "__main__":

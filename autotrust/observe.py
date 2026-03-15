@@ -40,8 +40,11 @@ def configure_structlog() -> None:
 
     structlog.configure(
         processors=[
+            structlog.stdlib.PositionalArgumentsFormatter(),
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
             renderer,
         ],
         wrapper_class=structlog.stdlib.BoundLogger,
@@ -75,6 +78,11 @@ class RunContext:
 def _status_path(ctx: RunContext) -> Path:
     """Return the status.json path for a run."""
     return ctx.run_dir / "status.json"
+
+
+def _status_history_path(ctx: RunContext) -> Path:
+    """Return the status_history.jsonl path for a run."""
+    return ctx.run_dir / "status_history.jsonl"
 
 
 def update_run_status(
@@ -117,6 +125,11 @@ def update_run_status(
         payload.pop("error", None)
 
     status_path.write_text(json.dumps(payload, indent=2))
+
+    history_path = _status_history_path(ctx)
+    with open(history_path, "a") as f:
+        f.write(json.dumps(dict(payload), default=str) + "\n")
+
     return payload
 
 
@@ -158,7 +171,7 @@ def start_run(spec: Spec, base_dir: Path | None = None) -> RunContext:
         message="Run created. Waiting to load data.",
     )
 
-    logger.info("Started run %s at %s", run_id, ctx.start_time.isoformat())
+    logger.info("Started run", run_id=run_id, start_time=ctx.start_time.isoformat())
     return ctx
 
 
@@ -194,7 +207,7 @@ def log_predictions(ctx: RunContext, predictions: list[dict[str, Any]]) -> None:
         for pred in predictions:
             f.write(json.dumps(pred, default=str) + "\n")
 
-    logger.info("Logged %d predictions to %s", len(predictions), pred_path)
+    logger.info("Logged predictions", count=len(predictions), path=str(pred_path))
 
 
 def finalize_run(ctx: RunContext) -> RunArtifacts:
@@ -234,7 +247,7 @@ def finalize_run(ctx: RunContext) -> RunArtifacts:
         summary_txt=summary_path,
     )
 
-    logger.info("Run %s finalized. Summary at %s", ctx.run_id, summary_path)
+    logger.info("Run finalized", run_id=ctx.run_id, summary=str(summary_path))
     return artifacts
 
 
