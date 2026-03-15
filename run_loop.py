@@ -308,6 +308,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Optional cap on eval chains to score per experiment (useful for demo runs)",
     )
     parser.add_argument(
+        "--mock-agent",
+        action="store_true",
+        help="Skip live agent calls and simulate no-op proposals (useful for transition smoke tests)",
+    )
+    parser.add_argument(
         "--no-dashboard",
         action="store_true",
         help="Skip launching the Gradio dashboard",
@@ -331,6 +336,58 @@ def _get_time_limit(spec: Any, stage: str) -> int:
 def _should_auto_transition(stage: str, consecutive_no_improvement: int) -> bool:
     """Check if auto-transition from Stage 1 to Stage 2 should occur."""
     return stage == "prompt" and consecutive_no_improvement >= 3
+
+
+def _maybe_auto_transition(
+    stage: str,
+    consecutive_no_improvement: int,
+    spec: Any,
+    run_ctx: Any | None = None,
+    experiment_num: int | None = None,
+) -> tuple[str, int]:
+    """Auto-transition Stage 1 -> Stage 2 when the no-improvement streak hits the threshold."""
+    if not _should_auto_transition(stage, consecutive_no_improvement):
+        return stage, consecutive_no_improvement
+
+    logger.info(
+        "Auto-transition trigger reached",
+        from_stage=stage,
+        to_stage="train",
+        no_improvement_streak=consecutive_no_improvement,
+        experiment=experiment_num,
+    )
+    if run_ctx is not None:
+        update_run_status(
+            run_ctx,
+            state="running",
+            phase="auto-transition",
+            stage=stage,
+            experiment_num=experiment_num,
+            message="Auto-transitioning to Stage 2 after repeated prompt-stage stalls.",
+            details={
+                "current_experiment": experiment_num,
+                "no_improvement_streak": consecutive_no_improvement,
+                "next_stage": "train",
+            },
+        )
+
+    new_stage = _auto_transition(spec)
+
+    if run_ctx is not None:
+        update_run_status(
+            run_ctx,
+            state="running",
+            phase="transition-complete",
+            stage=new_stage,
+            experiment_num=experiment_num,
+            message="Stage 2 is ready. The next experiment will run student-model training.",
+            details={
+                "current_experiment": experiment_num,
+                "next_stage": new_stage,
+            },
+        )
+
+    return new_stage, 0
 
 
 def _auto_transition(spec: Any) -> str:
@@ -522,6 +579,8 @@ def _run_stage2_iteration(
     consecutive_no_improvement: int,
     experiment_start: float,
     eval_limit: int | None = None,
+    run_ctx: Any | None = None,
+    mock_agent: bool = False,
 ) -> dict | None:
     """Run a single Stage 2 experiment iteration.
 
@@ -551,15 +610,56 @@ def _run_stage2_iteration(
     )
 
     # Call agent for train.py edits
+    logger.info(
+        "Calling agent to propose Stage 2 train.py edits...",
+        model=spec.providers.agent.model,
+    )
+    if run_ctx is not None:
+        update_run_status(
+            run_ctx,
+            state="running",
+            phase="stage2-calling-agent",
+            stage="train",
+            experiment_num=experiment_num,
+            message=f"Calling agent for Stage 2 experiment {experiment_num}.",
+            details={
+                "current_experiment": experiment_num,
+                "agent_model": spec.providers.agent.model,
+            },
+        )
     try:
-        proposed_edit = _call_agent(prompt, spec)
+        if mock_agent:
+            logger.info("Mock agent enabled; skipping live Stage 2 agent call.")
+            proposed_edit = None
+        else:
+            proposed_edit = _call_agent(prompt, spec)
         experiment_cost = 0.01
         _check_experiment_timeout(experiment_start, spec)
     except ExperimentTimeout as exc:
         logger.warning("Stage 2 experiment timed out during agent call", experiment=experiment_num, error=str(exc))
+        if run_ctx is not None:
+            update_run_status(
+                run_ctx,
+                state="running",
+                phase="stage2-calling-agent",
+                stage="train",
+                experiment_num=experiment_num,
+                message=f"Stage 2 experiment {experiment_num} timed out during agent call.",
+                error=str(exc),
+            )
         return None
     except Exception as exc:
         logger.error("Agent call failed in Stage 2", error=str(exc))
+        if run_ctx is not None:
+            update_run_status(
+                run_ctx,
+                state="running",
+                phase="stage2-calling-agent",
+                stage="train",
+                experiment_num=experiment_num,
+                message=f"Stage 2 experiment {experiment_num} failed during agent call.",
+                error=str(exc),
+            )
         return None
 
     # Apply edit
@@ -567,10 +667,28 @@ def _run_stage2_iteration(
         Path("train.py").write_text(proposed_edit)
     else:
         logger.info("Agent proposed no change in Stage 2.")
+        if run_ctx is not None:
+            update_run_status(
+                run_ctx,
+                state="running",
+                phase="stage2-no-change",
+                stage="train",
+                experiment_num=experiment_num,
+                message=f"Stage 2 experiment {experiment_num} proposed no change.",
+            )
         return None
 
     # Run train.py as subprocess
     logger.info("Running train.py as subprocess (Stage 2)...")
+    if run_ctx is not None:
+        update_run_status(
+            run_ctx,
+            state="running",
+            phase="stage2-running-train",
+            stage="train",
+            experiment_num=experiment_num,
+            message=f"Running Stage 2 trainer for experiment {experiment_num}.",
+        )
     timeout_seconds = int(spec.limits.per_experiment_timeout_minutes * 60)
     try:
         result = subprocess.run(
@@ -580,14 +698,44 @@ def _run_stage2_iteration(
         )
         if result.returncode != 0:
             logger.error("Stage 2 train.py failed", stderr=result.stderr[:500])
+            if run_ctx is not None:
+                update_run_status(
+                    run_ctx,
+                    state="running",
+                    phase="stage2-running-train",
+                    stage="train",
+                    experiment_num=experiment_num,
+                    message=f"Stage 2 trainer failed for experiment {experiment_num}.",
+                    error=result.stderr[:300] if result.stderr else "train.py exited non-zero",
+                )
             Path("train.py").write_text(train_py)  # restore
             return None
     except subprocess.TimeoutExpired:
         logger.warning("Stage 2 train.py timed out", timeout_sec=timeout_seconds)
+        if run_ctx is not None:
+            update_run_status(
+                run_ctx,
+                state="running",
+                phase="stage2-running-train",
+                stage="train",
+                experiment_num=experiment_num,
+                message=f"Stage 2 trainer timed out for experiment {experiment_num}.",
+                error=f"Timed out after {timeout_seconds}s",
+            )
         Path("train.py").write_text(train_py)
         return None
     except Exception as exc:
         logger.error("Stage 2 subprocess error", error=str(exc))
+        if run_ctx is not None:
+            update_run_status(
+                run_ctx,
+                state="running",
+                phase="stage2-running-train",
+                stage="train",
+                experiment_num=experiment_num,
+                message=f"Stage 2 trainer crashed for experiment {experiment_num}.",
+                error=str(exc),
+            )
         Path("train.py").write_text(train_py)
         return None
 
@@ -595,6 +743,15 @@ def _run_stage2_iteration(
     checkpoint_path = _find_latest_checkpoint()
     if checkpoint_path is None:
         logger.warning("No checkpoint found after Stage 2 train.py run")
+        if run_ctx is not None:
+            update_run_status(
+                run_ctx,
+                state="running",
+                phase="stage2-running-train",
+                stage="train",
+                experiment_num=experiment_num,
+                message=f"Stage 2 experiment {experiment_num} produced no checkpoint.",
+            )
         Path("train.py").write_text(train_py)
         return None
 
@@ -602,6 +759,20 @@ def _run_stage2_iteration(
     eval_chains = load_eval_chains(limit=eval_limit)
     if not eval_chains:
         return None
+
+    if run_ctx is not None:
+        update_run_status(
+            run_ctx,
+            state="running",
+            phase="stage2-scoring-eval",
+            stage="train",
+            experiment_num=experiment_num,
+            message=f"Scoring {len(eval_chains)} eval chains with the Stage 2 checkpoint.",
+            details={
+                "current_experiment": experiment_num,
+                "eval_count": len(eval_chains),
+            },
+        )
 
     axis_names = [a.name for a in spec.trust_axes]
     texts = [
@@ -731,6 +902,7 @@ def run_autoresearch(
     max_experiments: int = 50,
     stage: str = "prompt",
     eval_limit: int | None = None,
+    mock_agent: bool = False,
     stop_check: Callable[[], bool] | None = None,
     pause_check: Callable[[], bool] | None = None,
 ) -> None:
@@ -902,6 +1074,8 @@ def run_autoresearch(
                     consecutive_no_improvement=consecutive_no_improvement,
                     experiment_start=experiment_start,
                     eval_limit=eval_limit,
+                    run_ctx=run_ctx,
+                    mock_agent=mock_agent,
                 )
                 if stage2_result is None:
                     update_run_status(
@@ -913,6 +1087,10 @@ def run_autoresearch(
                         message=f"Stage 2 experiment {experiment_num} produced no checkpoint or scores.",
                     )
                     consecutive_no_improvement += 1
+                    stage, consecutive_no_improvement = _maybe_auto_transition(
+                        stage, consecutive_no_improvement, spec, run_ctx, experiment_num
+                    )
+                    time_limit = _get_time_limit(spec, stage)
                     continue
                 outputs = stage2_result["outputs"]
                 checkpoint_path = stage2_result["checkpoint_path"]
@@ -943,7 +1121,11 @@ def run_autoresearch(
                     },
                 )
                 try:
-                    proposed_edit = _call_agent(prompt, spec)
+                    if mock_agent:
+                        logger.info("Mock agent enabled; skipping live Stage 1 agent call.")
+                        proposed_edit = None
+                    else:
+                        proposed_edit = _call_agent(prompt, spec)
                     agent_duration = time.time() - experiment_start
                     experiment_cost += 0.01
                     logger.info("Agent responded", duration_sec=f"{agent_duration:.1f}s")
@@ -960,6 +1142,10 @@ def run_autoresearch(
                         error=str(exc),
                     )
                     consecutive_no_improvement += 1
+                    stage, consecutive_no_improvement = _maybe_auto_transition(
+                        stage, consecutive_no_improvement, spec, run_ctx, experiment_num
+                    )
+                    time_limit = _get_time_limit(spec, stage)
                     continue
                 except Exception as exc:
                     logger.error("Agent call failed", error=str(exc))
@@ -973,6 +1159,10 @@ def run_autoresearch(
                         error=str(exc),
                     )
                     consecutive_no_improvement += 1
+                    stage, consecutive_no_improvement = _maybe_auto_transition(
+                        stage, consecutive_no_improvement, spec, run_ctx, experiment_num
+                    )
+                    time_limit = _get_time_limit(spec, stage)
                     continue
 
                 if proposed_edit and proposed_edit.strip() != train_py.strip():
@@ -1033,6 +1223,10 @@ def run_autoresearch(
                         )
                         Path("train.py").write_text(train_py)
                         consecutive_no_improvement += 1
+                        stage, consecutive_no_improvement = _maybe_auto_transition(
+                            stage, consecutive_no_improvement, spec, run_ctx, experiment_num
+                        )
+                        time_limit = _get_time_limit(spec, stage)
                         continue
                 else:
                     change_desc = f"No change proposed (experiment {experiment_num})"
@@ -1046,6 +1240,10 @@ def run_autoresearch(
                         message=f"Experiment {experiment_num} proposed no change.",
                     )
                     consecutive_no_improvement += 1
+                    stage, consecutive_no_improvement = _maybe_auto_transition(
+                        stage, consecutive_no_improvement, spec, run_ctx, experiment_num
+                    )
+                    time_limit = _get_time_limit(spec, stage)
                     continue
                 logger.info("Scoring eval chains...", count=len(eval_chains))
                 update_run_status(
@@ -1098,6 +1296,10 @@ def run_autoresearch(
                     )
                     Path("train.py").write_text(train_py)
                     consecutive_no_improvement += 1
+                    stage, consecutive_no_improvement = _maybe_auto_transition(
+                        stage, consecutive_no_improvement, spec, run_ctx, experiment_num
+                    )
+                    time_limit = _get_time_limit(spec, stage)
                     continue
                 except Exception as exc:
                     scoring_error = traceback.format_exc()
@@ -1132,6 +1334,10 @@ def run_autoresearch(
                     )
                     Path("train.py").write_text(train_py)
                     consecutive_no_improvement += 1
+                    stage, consecutive_no_improvement = _maybe_auto_transition(
+                        stage, consecutive_no_improvement, spec, run_ctx, experiment_num
+                    )
+                    time_limit = _get_time_limit(spec, stage)
                     continue
 
             logger.info("Running three-gate evaluation...")
@@ -1203,6 +1409,10 @@ def run_autoresearch(
                     if stage != "train":
                         Path("train.py").write_text(train_py)
                     consecutive_no_improvement += 1
+                    stage, consecutive_no_improvement = _maybe_auto_transition(
+                        stage, consecutive_no_improvement, spec, run_ctx, experiment_num
+                    )
+                    time_limit = _get_time_limit(spec, stage)
                     continue
 
             per_axis_metrics = score_predictions(predictions, ground_truth, spec)
@@ -1259,10 +1469,10 @@ def run_autoresearch(
             else:
                 consecutive_no_improvement += 1
 
-            if _should_auto_transition(stage, consecutive_no_improvement):
-                stage = _auto_transition(spec)
-                time_limit = _get_time_limit(spec, stage)
-                consecutive_no_improvement = 0
+            stage, consecutive_no_improvement = _maybe_auto_transition(
+                stage, consecutive_no_improvement, spec, run_ctx, experiment_num
+            )
+            time_limit = _get_time_limit(spec, stage)
 
             total_cost += experiment_cost
             experiment_elapsed = time.time() - experiment_start
@@ -1398,4 +1608,5 @@ if __name__ == "__main__":
         max_experiments=args.max_experiments,
         stage=args.stage,
         eval_limit=args.eval_limit,
+        mock_agent=args.mock_agent,
     )

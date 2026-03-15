@@ -41,6 +41,13 @@ def test_cli_eval_limit_argument():
     assert args.eval_limit == 100
 
 
+def test_cli_mock_agent_argument():
+    """Parsing --mock-agent enables deterministic smoke runs."""
+    from run_loop import _parse_args
+    args = _parse_args(["--mock-agent"])
+    assert args.mock_agent is True
+
+
 def test_auto_transition_triggers(spec):
     """After 3 consecutive no-improvement with stage='prompt', triggers transition."""
     from run_loop import _should_auto_transition
@@ -473,6 +480,38 @@ def test_auto_transition_changes_stage_midloop(spec, tmp_path, monkeypatch):
         new_stage = _auto_transition(spec)
         assert new_stage == "train"
         mock_freeze.assert_called_once_with(spec)
+
+
+def test_mock_agent_no_change_run_auto_transitions_into_stage2(spec, tmp_path, monkeypatch):
+    """Three no-change prompt experiments should still trigger Stage 2 on the next loop iteration."""
+    from run_loop import run_autoresearch
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "starting_train.py").write_text("# stage 1 template\n")
+    (tmp_path / "train.py").write_text("# working copy\n")
+    (tmp_path / "program.md").write_text("# test program\n")
+
+    mock_run_ctx = MagicMock(run_id="test-run", run_dir=tmp_path)
+
+    with patch("run_loop.get_spec", return_value=spec), \
+         patch("run_loop.load_calibration", return_value=MagicMock()), \
+         patch("run_loop.start_run", return_value=mock_run_ctx), \
+         patch("run_loop.load_eval_chains", return_value=[MagicMock()]), \
+         patch("run_loop.load_gold_chains", return_value=[]), \
+         patch("run_loop.finalize_run"), \
+         patch("run_loop.update_run_status"), \
+         patch("run_loop._auto_transition", return_value="train") as mock_transition, \
+         patch("run_loop._run_stage2_iteration", return_value=None) as mock_stage2:
+
+        run_autoresearch(
+            max_experiments=4,
+            stage="prompt",
+            eval_limit=1,
+            mock_agent=True,
+        )
+
+    mock_transition.assert_called_once_with(spec)
+    mock_stage2.assert_called_once()
 
 
 def test_generated_stage2_template_trains_and_writes_metrics(tmp_path, monkeypatch):
