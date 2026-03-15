@@ -161,7 +161,15 @@ def _run_snapshot(status: dict, metrics: list[dict]) -> str:
         lines.extend(["", f"**Message:** {status['message']}"])
 
     if not metrics:
-        lines.extend(["", "_No scored experiments yet. Charts populate after `metrics.jsonl` entries are written._"])
+        if status.get("state") == "completed":
+            lines.extend(
+                [
+                    "",
+                    "_Run completed without scored experiments. The live snapshot and timeline stay visible until a newer run starts._",
+                ]
+            )
+        else:
+            lines.extend(["", "_No scored experiments yet. Charts populate after `metrics.jsonl` entries are written._"])
 
     return "\n".join(lines)
 

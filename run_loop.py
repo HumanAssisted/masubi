@@ -1774,8 +1774,10 @@ def _launch_dashboard(port: int = 7860) -> None:
     try:
         proc = subprocess.Popen(
             [sys.executable, str(dashboard_path), "--port", str(port)],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            close_fds=True,
             start_new_session=True,
         )
     except Exception as exc:

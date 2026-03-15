@@ -57,6 +57,26 @@ def test_completed_summary_only_run_is_detected(tmp_path):
     assert state == "completed"
 
 
+def test_external_run_stays_pinned_after_completion():
+    """Once the Live tab follows an external run, it should stay on it through completion."""
+    from autotrust.dashboard.run_manager import RunManager
+
+    rm = RunManager()
+
+    with patch.object(
+        RunManager,
+        "_detect_active_run_with_state",
+        side_effect=[
+            ("20260315_020000_keepme", "running"),
+            ("20260315_020000_keepme", "completed"),
+            (None, "idle"),
+        ],
+    ), patch.object(RunManager, "_state_for_run", return_value="completed"):
+        assert rm.current_run_id == "20260315_020000_keepme"
+        assert rm.status == "completed (external)"
+        assert rm.current_run_id == "20260315_020000_keepme"
+
+
 def test_stale_running_status_does_not_beat_completed_run(tmp_path):
     """Old external heartbeats should not keep the Live tab pinned to dead runs."""
     from autotrust.dashboard.run_manager import RunManager

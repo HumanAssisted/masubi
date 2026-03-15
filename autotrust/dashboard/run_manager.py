@@ -23,6 +23,7 @@ class RunManager:
         self._pause_event = threading.Event()
         self._pause_event.set()  # set = NOT paused (normal running)
         self._current_run_id: str | None = None
+        self._current_run_external: bool = False
         self._status: str = "idle"
         self._last_error: BaseException | None = None
 
@@ -39,6 +40,7 @@ class RunManager:
         self._existing_run_dirs = self._list_run_dirs()
 
         self._current_run_id = None
+        self._current_run_external = False
         self._last_error = None
 
         # Reset events
@@ -86,18 +88,26 @@ class RunManager:
 
     @property
     def status(self) -> str:
-        if self._status == "idle" and self._current_run_id is None:
-            ext_run, ext_state = self._detect_active_run_with_state()
+        if self._status == "idle":
+            if self._current_run_id is not None and not self._current_run_external:
+                state = self._state_for_run(self._current_run_id)
+                return state if state not in {"unknown", "idle"} else "idle"
+            ext_run, ext_state = self._follow_external_run()
             if ext_run is not None:
                 return f"{ext_state} (external)"
         return self._status
 
     @property
     def current_run_id(self) -> str | None:
-        if self._current_run_id is not None:
+        if self._current_run_id is not None and not self._current_run_external:
             return self._current_run_id
-        # Auto-detect the most recent active run (started from CLI or elsewhere)
-        return self._detect_active_run()
+        if self._current_run_id is not None and self._current_run_external:
+            run_id, _state = self._follow_external_run()
+            return run_id
+        if self._thread is not None and self._status in {"running", "paused", "stopping"}:
+            return None
+        run_id, _state = self._follow_external_run()
+        return run_id
 
     @property
     def last_error(self) -> BaseException | None:
@@ -189,6 +199,58 @@ class RunManager:
         run_id, _state = cls._detect_active_run_with_state(base_dir=base_dir)
         return run_id
 
+    @classmethod
+    def _state_for_run(cls, run_id: str | None, base_dir: Path = Path("runs")) -> str:
+        """Return the current best-known lifecycle state for a specific run."""
+        if not run_id:
+            return "idle"
+
+        entry = base_dir / run_id
+        if not entry.exists():
+            return "idle"
+
+        if (entry / "summary.txt").exists():
+            return "completed"
+
+        status = cls._load_run_status(entry)
+        state = status.get("state")
+        if state in _ACTIVE_STATES and cls._status_is_fresh(status):
+            return state
+        if state:
+            return "interrupted"
+        if (entry / "metrics.jsonl").exists():
+            return "interrupted"
+        return "unknown"
+
+    def _follow_external_run(self, base_dir: Path = Path("runs")) -> tuple[str | None, str]:
+        """Stick to the current external run until a newer run supersedes it."""
+        detected_run, detected_state = self._detect_active_run_with_state(base_dir=base_dir)
+
+        if self._current_run_id is None:
+            if detected_run is None:
+                return None, "idle"
+            self._current_run_id = detected_run
+            self._current_run_external = True
+            return detected_run, detected_state
+
+        current_state = self._state_for_run(self._current_run_id, base_dir=base_dir)
+        current_entry = base_dir / self._current_run_id
+        if current_state == "idle" and not current_entry.exists():
+            self._current_run_id = None
+            self._current_run_external = False
+            if detected_run is None:
+                return None, "idle"
+            self._current_run_id = detected_run
+            self._current_run_external = True
+            return detected_run, detected_state
+
+        if detected_run is not None and detected_run > self._current_run_id:
+            self._current_run_id = detected_run
+            self._current_run_external = True
+            return detected_run, detected_state
+
+        return self._current_run_id, current_state
+
     def _detect_run_id(self) -> None:
         """Detect the actual run_id by finding new directories in runs/."""
         current_dirs = self._list_run_dirs()
@@ -196,6 +258,7 @@ class RunManager:
         if new_dirs:
             # Pick the most recent (lexicographic sort works since run IDs start with timestamps)
             self._current_run_id = sorted(new_dirs)[-1]
+            self._current_run_external = False
             logger.info("Detected run_id: %s", self._current_run_id)
 
     def _run_wrapper(self, max_experiments: int) -> None:
