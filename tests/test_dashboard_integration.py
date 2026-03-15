@@ -44,20 +44,8 @@ def test_dashboard_has_required_components():
     assert len(app.blocks) > 0
 
     block_types = [type(b).__name__ for b in app.blocks.values()]
-    assert "Button" in block_types
     assert "Plot" in block_types
     assert "Markdown" in block_types
-    assert "Number" in block_types
-
-
-def test_start_button_calls_run_manager():
-    """Mock RunManager, click start, verify start() is called."""
-    from dashboard import _run_manager, handle_start
-
-    with patch.object(_run_manager, "start", return_value="starting") as mock_start:
-        result = handle_start(50)
-        mock_start.assert_called_once_with(50)
-        assert "Running" in result
 
 
 def test_poll_live_returns_correct_tuple(sample_metrics):

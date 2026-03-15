@@ -47,32 +47,6 @@ def _refresh_poll_cache() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Button handlers
-# ---------------------------------------------------------------------------
-
-def handle_start(max_exp):
-    try:
-        _run_manager.start(int(max_exp))
-        return "Running..."
-    except RuntimeError as exc:
-        return f"Error: {exc}"
-
-
-def handle_stop():
-    _run_manager.stop()
-    return "Stopped"
-
-
-def handle_pause_resume():
-    if _run_manager.status == "paused":
-        _run_manager.resume()
-        return "Running"
-    else:
-        _run_manager.pause()
-        return "Paused"
-
-
-# ---------------------------------------------------------------------------
 # Status banner
 # ---------------------------------------------------------------------------
 
@@ -258,17 +232,12 @@ def _results_summary(
 # ---------------------------------------------------------------------------
 
 def _build_live_tab():
-    """Tab 1: Monitor the running loop."""
-    # Controls
-    with gr.Row():
-        start_btn = gr.Button("Start Run", variant="primary", scale=2)
-        stop_btn = gr.Button("Stop", variant="stop", scale=1)
-        pause_btn = gr.Button("Pause / Resume", scale=1)
-        max_exp_input = gr.Number(value=10, label="Max Experiments", precision=0, scale=1)
-        status_box = gr.Textbox(value="idle", label="Status", interactive=False, scale=1)
+    """Tab 1: Monitor the running loop (view-only -- runs are started from CLI)."""
+    # Status
+    status_box = gr.Textbox(value="idle", label="Status", interactive=False)
 
     # Status banner
-    banner = gr.Markdown(value="Waiting for first experiment...")
+    banner = gr.Markdown(value="Waiting for first experiment... (start a run with `uv run python run_loop.py`)")
 
     # Hero chart: composite trend
     composite_plot = gr.Plot(label="Composite Score Over Time")
@@ -282,11 +251,6 @@ def _build_live_tab():
 
     # Log stream
     log_stream = gr.Markdown(value="No experiments yet.")
-
-    # Wire buttons
-    start_btn.click(handle_start, inputs=[max_exp_input], outputs=[status_box])
-    stop_btn.click(handle_stop, outputs=[status_box])
-    pause_btn.click(handle_pause_resume, outputs=[status_box])
 
     # Poll every 2 seconds
     timer = gr.Timer(value=2)

@@ -175,6 +175,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional cap on eval chains to score per experiment (useful for demo runs)",
     )
+    parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="Skip launching the Gradio dashboard",
+    )
     return parser.parse_args(argv)
 
 
@@ -920,8 +925,39 @@ def run_autoresearch(
     )
 
 
+def _launch_dashboard(port: int = 7860) -> None:
+    """Launch the Gradio dashboard in a background thread and open the browser."""
+    import threading
+    import webbrowser
+
+    def _run():
+        try:
+            from dashboard import create_app, _THEME
+            app = create_app()
+            app.launch(
+                theme=_THEME,
+                server_port=port,
+                quiet=True,
+                prevent_thread_lock=True,
+            )
+        except Exception as exc:
+            logger.warning("Dashboard failed to start: %s", exc)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    # Give Gradio a moment to bind, then open browser
+    import time as _time
+    _time.sleep(1.5)
+    webbrowser.open(f"http://localhost:{port}")
+    logger.info("Dashboard launched at http://localhost:%d", port)
+
+
 if __name__ == "__main__":
     args = _parse_args()
+
+    if not args.no_dashboard:
+        _launch_dashboard()
+
     run_autoresearch(
         max_experiments=args.max_experiments,
         stage=args.stage,
