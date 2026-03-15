@@ -191,7 +191,8 @@ def test_stop_check_callback_exits_loop(spec, tmp_path, isolated_workspace):
          patch("run_loop.start_run") as mock_run, \
          patch("run_loop.load_eval_chains", return_value=[MagicMock()]), \
          patch("run_loop.load_gold_chains", return_value=[]), \
-         patch("run_loop.finalize_run"):
+         patch("run_loop.finalize_run"), \
+         patch("run_loop.update_run_status"):
 
         mock_cal.return_value = MagicMock()
         mock_run.return_value = MagicMock(run_dir=tmp_path)
@@ -226,6 +227,7 @@ def test_pause_check_callback_blocks(spec, tmp_path, isolated_workspace):
          patch("run_loop.load_eval_chains", return_value=[MagicMock()]), \
          patch("run_loop.load_gold_chains", return_value=[]), \
          patch("run_loop.finalize_run"), \
+         patch("run_loop.update_run_status"), \
          patch("run_loop.time") as mock_time:
 
         mock_cal.return_value = MagicMock()
@@ -340,7 +342,8 @@ def test_callbacks_default_none_backward_compatible(spec, tmp_path):
          patch("run_loop.start_run") as mock_run, \
          patch("run_loop.load_eval_chains", return_value=[]), \
          patch("run_loop.load_gold_chains", return_value=[]), \
-         patch("run_loop.finalize_run"):
+         patch("run_loop.finalize_run"), \
+         patch("run_loop.update_run_status"):
 
         mock_cal.return_value = MagicMock()
         mock_run.return_value = MagicMock(run_dir=tmp_path)
