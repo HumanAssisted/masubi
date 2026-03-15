@@ -159,7 +159,11 @@ def poll_live():
         run_id = _run_manager.current_run_id
         if run_id:
             history = data_loader.load_run_status_history(run_id, limit=8)
-            log_stream = log_formatter.format_status_history(history)
+            if history:
+                log_stream = log_formatter.format_status_history(history)
+            else:
+                run_status = _load_current_run_status()
+                log_stream = run_status.get("message", "No experiments yet.")
         else:
             run_status = _load_current_run_status()
             log_stream = run_status.get("message", "No experiments yet.")

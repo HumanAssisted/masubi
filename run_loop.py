@@ -675,7 +675,7 @@ def _call_agent(prompt: str, spec: Any) -> str | None:
     ]
 
     response = client.messages.create(
-        model=spec.providers.judge_secondary.model,  # Use Sonnet for agent
+        model=spec.providers.judge_primary.model,  # Use Opus for better code quality
         max_tokens=4096,
         tools=tools,
         messages=[{"role": "user", "content": prompt}],

@@ -311,6 +311,7 @@ def test_validate_stage1_candidate_accepts_baseline(spec, isolated_workspace):
     """The baseline Stage 1 template should pass the pre-score smoke validation."""
     from run_loop import _validate_stage1_candidate
 
+    Path("train.py").write_text(Path("starting_train.py").read_text())
     assert _validate_stage1_candidate(Path("train.py"), spec) is None
 
 
@@ -324,7 +325,7 @@ import re
 
 class EmailTrustScorer(BaseScorer):
     def _parse_response(self, raw):
-        raw = re.sub(r"```json|```", "\\1", raw)
+        raw = re.sub(r"```json|```", r"\\1", raw)
         return super()._parse_response(raw)
 """
     )
